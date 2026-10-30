@@ -1,0 +1,46 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Tool and download caches
+.cache/
+.torchinductor*/
+
+# Downloaded / processed datasets (keep input.txt and data docs)
+data/raw/
+data/processed/
+edu_fineweb10B/
+*.npy
+*.npz
+*.parquet
+*.arrow
+
+# Model weights and full run logs (curated results/ stays tracked)
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+runs/
+logs/
+wandb/
+
+# Local credentials and editor / OS files
+.env
+.env.*
+!.env.example
+*.pem
+*.ppk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Upload and backup archives
+*.zip
+*.tar
+*.tar.gz

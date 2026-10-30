@@ -1,0 +1,4 @@
+# Install the CUDA build of PyTorch appropriate for your GPU/driver first.
+# https://pytorch.org/get-started/locally/
+torch
+tiktoken
