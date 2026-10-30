@@ -1,4 +1,11 @@
 # Install the CUDA build of PyTorch appropriate for your GPU/driver first.
 # https://pytorch.org/get-started/locally/
+# PyTorch is kept unpinned here to accept a cloud image's CUDA build.
+# See requirements-local.txt for the exact local Windows CUDA environment.
 torch
-tiktoken
+
+# Versions recorded from the existing local development environment.
+tiktoken==0.14.0
+transformers==4.57.1
+
+# Python >= 3.10. Standard-library modules and torch.distributed need no entry.
