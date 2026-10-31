@@ -12,6 +12,7 @@ import tiktoken
 from pathlib import Path
 import time
 import inspect
+import numpy as np
 
 
 class CausalSelfAttention(nn.Module):
@@ -145,31 +146,46 @@ class GPT(nn.Module):
         return optimizer
 
 
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
+
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
-        base_dir = Path(__file__).resolve().parent
-        file_path = base_dir/"input.txt"
-        with open(file_path, "r", encoding="utf-8") as f:
-            text = f.read()
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens)//(B*T)} batches")
-        self.current_position = self.B*self.T*self.process_rank
+        assert split in {'train', 'val'}
+        data_root = 'edu_fineweb10B'
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for {split}")
+        self.cur_shard = 0
+        self.tokens = load_tokens(self.shards[self.cur_shard])
+        self.cur_pos = self.B*self.T*self.process_rank
+
+    def reset(self):
+        self.cur_shard = 0
+        self.tokens = load_tokens(self.shards[self.cur_shard])
+        self.cur_pos = self.B*self.T*self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
-        buf = self.tokens[self.current_position:self.current_position+B*T+1]
+        buf = self.tokens[self.cur_pos:self.cur_pos+B*T+1]
         x = (buf[:-1]).view(B, T)
         y = (buf[1:]).view(B, T)
-        self.current_position += B*T*self.process_rank
-        if self.current_position + (B*T*self.process_rank+1) > len(self.tokens):
-            self.current_position = self.B*self.T*self.process_rank
+        self.cur_pos += B*T*self.process_rank
+        if self.cur_pos+B*T*self.num_processes+1 > len(self.tokens):
+            self.cur_shard = (self.cur_shard+1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.cur_shard])
+            self.cur_pos = self.B*self.T*self.process_rank
         return x, y
 
 
@@ -199,7 +215,7 @@ torch.manual_seed(1337)
 torch.cuda.manual_seed(1337)
 
 total_batch_size = 524288
-B = 8
+B = 16
 T = 1024
 assert total_batch_size % (B*T*ddp_world_size) == 0
 grad_accum_steps = total_batch_size//(B*T*ddp_world_size)
@@ -208,7 +224,10 @@ if master_process:
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 train_loader = DataLoaderLite(
-    B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+    B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='train')
+val_loader = DataLoaderLite(
+    B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='val')
+
 torch.set_float32_matmul_precision('high')
 
 model = GPT(GPTConfig(vocab_size=50304))
@@ -219,10 +238,10 @@ if ddp:
 raw_model = model.module if ddp else model
 
 
-max_steps = 50
+max_steps = 19073
 max_lr = 6e-4
 min_lr = max_lr*0.1
-warmup_steps = 10
+warmup_steps = 715
 
 
 def get_lr(it):
@@ -238,8 +257,27 @@ def get_lr(it):
 
 optimizer = raw_model.configure_optimizers(
     weight_decay=0.1, learning_rate=6e-4, device=device)
+
 for step in range(max_steps):
     t0 = time.time()
+    if step % 100 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss/val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+    model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
@@ -247,14 +285,14 @@ for step in range(max_steps):
         x, y = x.to(device), y.to(device)
         if ddp:
             model.require_backward_grad_sync = (
-                micro_step == grad_accum_steps - 1)
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                micro_step == grad_accum_steps-1)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         loss = loss/grad_accum_steps
         loss_accum += loss.detach()
         loss.backward()
     if ddp:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+        dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
@@ -262,12 +300,16 @@ for step in range(max_steps):
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
-    dt = t1-t0
-    tokens_processed = train_loader.B*train_loader.T*grad_accum_steps*ddp_world_size
-    tokens_per_sec = tokens_processed/dt
+    dt = t1 - t0
+    tokens_processed = train_loader.B * \
+        train_loader.T * grad_accum_steps * ddp_world_size
+    tokens_per_sec = tokens_processed / dt
     if master_process:
-        print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
+
+if ddp:
+    destroy_process_group()
 
 sys.exit(0)
 
