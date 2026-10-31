@@ -8,4 +8,9 @@ torch
 tiktoken==0.14.0
 transformers==4.57.1
 
+# FineWeb download, token arrays and progress reporting.
+datasets==4.4.1
+numpy==2.5.4
+tqdm==4.70.1
+
 # Python >= 3.10. Standard-library modules and torch.distributed need no entry.
