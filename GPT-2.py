@@ -23,10 +23,6 @@ class CausalSelfAttention(nn.Module):
         self.c_proj.GPT2_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embed = config.n_embed
-        self.register_buffer("bias", torch.tril(torch.ones(
-            config.block_size, config.block_size).view(
-                1, 1, config.block_size, config.block_size
-        )))
 
     def forward(self, x):
         B, T, C = x.size()
@@ -161,6 +157,7 @@ class DataLoaderLite:
         data_root = 'edu_fineweb10B'
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s]
+        shards = sorted(shards)
         shards = [os.path.join(data_root, s) for s in shards]
         self.shards = shards
         assert len(shards) > 0, f"no shards found for {split}"
@@ -180,7 +177,7 @@ class DataLoaderLite:
         buf = self.tokens[self.cur_pos:self.cur_pos+B*T+1]
         x = (buf[:-1]).view(B, T)
         y = (buf[1:]).view(B, T)
-        self.cur_pos += B*T*self.process_rank
+        self.cur_pos += B*T*self.num_processes
         if self.cur_pos+B*T*self.num_processes+1 > len(self.tokens):
             self.cur_shard = (self.cur_shard+1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.cur_shard])
@@ -228,6 +225,8 @@ else:
 
 torch.manual_seed(1337)
 torch.cuda.manual_seed(1337)
+
+device_type = "cuda" if device.startswith("cuda") else "cpu"
 
 enc = tiktoken.get_encoding("gpt2")
 
@@ -295,7 +294,7 @@ for step in range(max_steps):
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(x, y)
                 loss = loss/val_loss_steps
                 val_loss_accum += loss.detach()
@@ -313,7 +312,7 @@ for step in range(max_steps):
             tokens = tokens.to(device)
             mask = mask.to(device)
             with torch.no_grad():
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
@@ -345,7 +344,7 @@ for step in range(max_steps):
         sample_rng.manual_seed(42 + ddp_rank)
         while xgen.size(1) < max_length:
             with torch.no_grad():
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(xgen)
                 logits = logits[:, -1, :]
                 probs = F.softmax(logits, dim=-1)
@@ -366,13 +365,13 @@ for step in range(max_steps):
         if ddp:
             model.require_backward_grad_sync = (
                 micro_step == grad_accum_steps-1)
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         loss = loss/grad_accum_steps
         loss_accum += loss.detach()
         loss.backward()
     if ddp:
-        dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
