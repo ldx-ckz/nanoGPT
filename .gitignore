@@ -15,6 +15,7 @@ __pycache__/
 data/raw/
 data/processed/
 edu_fineweb10B/
+wikitext103/
 /hellaswag/
 *.npy
 *.npz

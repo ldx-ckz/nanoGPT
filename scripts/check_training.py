@@ -3,7 +3,8 @@
 Run from any directory: python scripts/check_training.py
 This does not start the full training loop or download datasets.
 """
-import ast
+import argparse
+import importlib.util
 from dataclasses import asdict, dataclass
 import inspect
 import os
@@ -18,35 +19,35 @@ from torch.nn import functional as F
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
-import hellaswag
 
 
 def load_training_definitions():
-    # The training entry runs on import; extract its actual classes/functions
-    # so checks cannot accidentally launch the 10B-token training run.
     source = PROJECT_DIR / "GPT-2.py"
-    tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
-    definitions = ast.Module(body=[node for node in tree.body if isinstance(
-        node, (ast.ClassDef, ast.FunctionDef))], type_ignores=[])
-    namespace = dict(globals(), master_process=False)
-    exec(compile(definitions, str(source), "exec"), namespace)
-    return namespace
+    spec = importlib.util.spec_from_file_location("gpt_training", source)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    module.master_process = False
+    return vars(module)
 
 
-def check_shards():
+def check_shards(data_root, splits=("train", "val", "test")):
     counts = {}
     total_tokens = 0
-    for split in ("train", "val"):
-        paths = sorted((PROJECT_DIR / "edu_fineweb10B").glob(f"*_{split}_*.npy"))
+    for split in splits:
+        split_tokens = 0
+        paths = sorted(data_root.glob(f"*_{split}_*.npy"))
         assert paths, f"No {split} shards found"
         for path in paths:
             tokens = np.load(path, mmap_mode="r", allow_pickle=False)
             assert tokens.ndim == 1 and tokens.dtype == np.uint16, str(path)
-            assert len(tokens) >= 16 * 1024 * 2 + 1, f"Shard too short for two GPUs: {path}"
+            assert len(tokens) > 0, f"Empty shard: {path}"
             sample = tokens[:4096]
             assert int(sample.max()) < 50257, f"Invalid GPT-2 token in {path}"
             total_tokens += len(tokens)
+            split_tokens += len(tokens)
             del tokens
+        assert split_tokens >= 16 * 1024 * 2 + 1, f"Split too short for default two-GPU batch: {split}"
         counts[split] = len(paths)
     print(f"Shard headers and token samples OK: {counts}, {total_tokens:,} total tokens")
 
@@ -55,23 +56,23 @@ def check_rank_boundaries(namespace):
     loader_type = namespace["DataLoaderLite"]
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        (root / "edu_fineweb10B").mkdir()
+        (root / "wikitext103").mkdir()
         for shard in range(2):
-            np.save(root / "edu_fineweb10B" / f"test_train_{shard:06d}.npy",
+            np.save(root / "wikitext103" / f"test_train_{shard:06d}.npy",
                     np.arange(51, dtype=np.uint16) + shard * 100)
         original_root = namespace["PROJECT_DIR"]
         namespace["PROJECT_DIR"] = root
         try:
             loaders = [loader_type(2, 4, rank, 2, "train") for rank in range(2)]
+            stream = torch.cat([torch.arange(51), torch.arange(100, 151)])
             for batch in range(12):
-                shard = (batch // 3) % 2
-                batch_start = (batch % 3) * 16
                 for rank, loader in enumerate(loaders):
                     x, y = loader.next_batch()
-                    start = shard * 100 + batch_start + rank * 8
-                    assert torch.equal(x.flatten(), torch.arange(start, start + 8))
-                    assert torch.equal(y.flatten(), torch.arange(start + 1, start + 9))
-                assert loaders[0].cur_shard == loaders[1].cur_shard
+                    indices = (torch.arange(9) + batch * 16 + rank * 8) % len(stream)
+                    expected = stream[indices]
+                    assert torch.equal(x.flatten(), expected[:-1])
+                    assert torch.equal(y.flatten(), expected[1:])
+                assert loaders[0].position == loaders[1].position
         finally:
             namespace["PROJECT_DIR"] = original_root
     print("Two-rank shard boundaries and shifted targets OK (simulated on CPU)")
@@ -112,14 +113,14 @@ def check_optimizer_and_checkpoint(namespace):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path)
+    args = parser.parse_args()
     print(f"Python: {sys.executable}")
     print(f"PyTorch: {torch.__version__}; visible CUDA GPUs: {torch.cuda.device_count()}")
     namespace = load_training_definitions()
-    check_shards()
-    cache = PROJECT_DIR / "hellaswag" / "hellaswag_val.jsonl"
-    assert cache.is_file(), "HellaSwag cache missing; prepare it before offline training"
-    hellaswag.validate_cache(cache, "val")
-    print("HellaSwag cache OK")
+    data_root = args.data_dir or PROJECT_DIR / "wikitext103"
+    check_shards(data_root)
     check_rank_boundaries(namespace)
     check_optimizer_and_checkpoint(namespace)
     print("Training preflight passed. Real multi-GPU NCCL training must run on Linux.")
