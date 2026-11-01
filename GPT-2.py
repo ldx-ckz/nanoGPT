@@ -3,7 +3,8 @@ import os
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -12,6 +13,8 @@ import inspect
 import numpy as np
 from hellaswag import render_example, iterate_examples
 import tiktoken
+
+PROJECT_DIR = Path(__file__).resolve().parent
 
 
 class CausalSelfAttention(nn.Module):
@@ -135,14 +138,16 @@ class GPT(nn.Module):
             f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         fused_available = 'fused' in inspect.signature(
             torch.optim.AdamW).parameters
-        print(f"using fused AdamW: {fused_available}")
+        use_fused = fused_available and str(device).startswith("cuda")
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(
-            0.9, 0.95), eps=1e-8, fused=fused_available)
+            0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
 
 def load_tokens(filename):
-    npt = np.load(filename)
+    npt = np.load(filename).astype(np.int32)
     ptt = torch.tensor(npt, dtype=torch.long)
     return ptt
 
@@ -154,9 +159,9 @@ class DataLoaderLite:
         self.process_rank = process_rank
         self.num_processes = num_processes
         assert split in {'train', 'val'}
-        data_root = 'edu_fineweb10B'
+        data_root = PROJECT_DIR / 'edu_fineweb10B'
         shards = os.listdir(data_root)
-        shards = [s for s in shards if split in s]
+        shards = [s for s in shards if split in s and s.endswith('.npy')]
         shards = sorted(shards)
         shards = [os.path.join(data_root, s) for s in shards]
         self.shards = shards
@@ -178,7 +183,9 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B, T)
         y = (buf[1:]).view(B, T)
         self.cur_pos += B*T*self.num_processes
-        if self.cur_pos+B*T*self.num_processes+1 > len(self.tokens):
+        # Decide using the shared batch position, so every rank switches together.
+        next_global_pos = self.cur_pos - B*T*self.process_rank
+        if next_global_pos+B*T*self.num_processes+1 > len(self.tokens):
             self.cur_shard = (self.cur_shard+1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.cur_shard])
             self.cur_pos = self.B*self.T*self.process_rank
@@ -224,7 +231,8 @@ else:
     print(f"using device: {device}")
 
 torch.manual_seed(1337)
-torch.cuda.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
 
 device_type = "cuda" if device.startswith("cuda") else "cpu"
 
@@ -276,11 +284,14 @@ def get_lr(it):
 optimizer = raw_model.configure_optimizers(
     weight_decay=0.1, learning_rate=6e-4, device=device)
 
-log_dir = "log"
+log_dir = PROJECT_DIR / "log"
+checkpoints_dir = PROJECT_DIR / "checkpoints"
 os.makedirs(log_dir, exist_ok=True)
+os.makedirs(checkpoints_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
-with open(log_file, "w") as f:
-    pass
+if master_process:
+    with open(log_file, "w") as f:
+        pass
 
 for step in range(max_steps):
     t0 = time.time()
@@ -302,6 +313,9 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+
     if (step % 250 == 0 or last_step) and (not use_compile):
         num_correct_norm = 0
         num_total = 0
@@ -332,30 +346,7 @@ for step in range(max_steps):
                 f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} hella {acc_norm:.4f}\n")
-    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
-        model.eval()
-        num_return_sequences = 4
-        max_length = 32
-        tokens = enc.encode("Hello, I'm a language model,")
-        tokens = torch.tensor(tokens, dtype=torch.long)
-        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-        xgen = tokens.to(device)
-        sample_rng = torch.Generator(device=device)
-        sample_rng.manual_seed(42 + ddp_rank)
-        while xgen.size(1) < max_length:
-            with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(xgen)
-                logits = logits[:, -1, :]
-                probs = F.softmax(logits, dim=-1)
-                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-                ix = torch.multinomial(topk_probs, 1, generator=sample_rng)
-                xcol = torch.gather(topk_indices, -1, ix)
-                xgen = torch.cat((xgen, xcol), dim=1)
-        for i in range(num_return_sequences):
-            tokens = xgen[i, :max_length].tolist()
-            decoded = enc.decode(tokens)
-            print(f"rank {ddp_rank} sample {i}: {decoded}")
+
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
@@ -377,7 +368,8 @@ for step in range(max_steps):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
-    torch.cuda.synchronize()
+    if device_type == "cuda":
+        torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
     tokens_processed = train_loader.B * \
@@ -385,7 +377,18 @@ for step in range(max_steps):
     tokens_per_sec = tokens_processed / dt
     if master_process:
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-
+        with open(log_file, "a") as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
+        if (step + 1) % 5000 == 0 or last_step:
+            checkpoints_path = checkpoints_dir / f"model_{step + 1:05d}.pt"
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'config': asdict(raw_model.config),
+                'step': step,
+                'completed_steps': step + 1,
+            }
+            torch.save(checkpoint, checkpoints_path)
+            print(f"saved checkpoint: {checkpoints_path}")
 
 if ddp:
     destroy_process_group()

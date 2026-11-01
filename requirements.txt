@@ -1,16 +1,10 @@
-# Install the CUDA build of PyTorch appropriate for your GPU/driver first.
-# https://pytorch.org/get-started/locally/
-# PyTorch is kept unpinned here to accept a cloud image's CUDA build.
-# See requirements-local.txt for the exact local Windows CUDA environment.
-torch
-
-# Versions recorded from the existing local development environment.
+# Install the CUDA-compatible PyTorch build for the target machine first.
+torch>=2.2.2
+numpy>=1.26.4,<3
 tiktoken==0.14.0
-transformers==4.57.1
-
-# FineWeb download, token arrays and progress reporting.
 datasets==4.4.1
-numpy==2.5.4
-tqdm==4.70.1
-
-# Python >= 3.10. Standard-library modules and torch.distributed need no entry.
+tqdm>=4.66,<5
+transformers==4.40.2
+huggingface-hub==0.36.2
+# Compatible with the cloud image's NumPy 1.26 and Python 3.11.
+pyarrow==21.0.0

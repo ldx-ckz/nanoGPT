@@ -27,6 +27,7 @@ checkpoints/
 *.pth
 *.safetensors
 runs/
+log/
 logs/
 wandb/
 
