@@ -56,12 +56,23 @@ class MLP(nn.Module):
         return x
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        normalized = x.float() * torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + self.eps)
+        return (normalized * self.weight).to(x.dtype)
+
+
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embed)
+        self.ln_1 = RMSNorm(config.n_embed)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embed)
+        self.ln_2 = RMSNorm(config.n_embed)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -87,7 +98,7 @@ class GPT(nn.Module):
             wte=nn.Embedding(config.vocab_size, config.n_embed),
             wpe=nn.Embedding(config.block_size, config.n_embed),
             h=nn.ModuleList([Block(config) for _ in range(config.n_layers)]),
-            ln_f=nn.LayerNorm(config.n_embed),
+            ln_f=RMSNorm(config.n_embed),
         ))
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
@@ -160,7 +171,8 @@ class DataLoaderLite:
         self.process_rank = process_rank
         self.num_processes = num_processes
         assert split in {'train', 'val', 'test'}
-        data_root = Path(data_root) if data_root is not None else PROJECT_DIR / 'wikitext103'
+        data_root = Path(
+            data_root) if data_root is not None else PROJECT_DIR / 'wikitext103'
         shards = sorted(data_root.glob(f'*_{split}_*.npy'))
         self.shards = shards
         assert len(shards) > 0, f"no shards found for {split}"
@@ -177,7 +189,8 @@ class DataLoaderLite:
             del array
         self.total_tokens = total
         if total < B*T*num_processes + 1:
-            raise ValueError(f'{split} has {total} tokens; batch needs at least {B*T*num_processes + 1}')
+            raise ValueError(
+                f'{split} has {total} tokens; batch needs at least {B*T*num_processes + 1}')
         self.reset()
 
     def reset(self):
@@ -207,25 +220,32 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B, T)
         y = (buf[1:]).view(B, T)
         # All ranks advance the same global token cursor, including across short tails.
-        self.position = (self.position + B*T*self.num_processes) % self.total_tokens
+        self.position = (self.position + B*T *
+                         self.num_processes) % self.total_tokens
         return x, y
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train the GPT-2 baseline on WikiText-103")
-    parser.add_argument("--data-dir", default="wikitext103", help="Shard directory, relative to the project or absolute")
-    parser.add_argument("--batch-size", type=int, default=16, help="Sequences per GPU")
+    parser = argparse.ArgumentParser(
+        description="Train the GPT-2 baseline on WikiText-103")
+    parser.add_argument("--data-dir", default="wikitext103",
+                        help="Shard directory, relative to the project or absolute")
+    parser.add_argument("--batch-size", type=int,
+                        default=16, help="Sequences per GPU")
     parser.add_argument("--seq-len", type=int, default=1024)
-    parser.add_argument("--total-batch-size", type=int, default=65536, help="Global tokens per optimizer update")
+    parser.add_argument("--total-batch-size", type=int,
+                        default=65536, help="Global tokens per optimizer update")
     budget = parser.add_mutually_exclusive_group()
     budget.add_argument("--max-steps", type=int)
-    budget.add_argument("--train-tokens", type=int, help="Rounded up to whole optimizer updates")
+    budget.add_argument("--train-tokens", type=int,
+                        help="Rounded up to whole optimizer updates")
     parser.add_argument("--max-lr", type=float, default=6e-4)
     parser.add_argument("--warmup-steps", type=int)
     parser.add_argument("--eval-interval", type=int, default=100)
     parser.add_argument("--val-batches", type=int, default=20)
     parser.add_argument("--checkpoint-interval", type=int, default=500)
-    parser.add_argument("--output-dir", default="runs/wikitext103", help="Run directory; logs and checkpoints are stored inside")
+    parser.add_argument("--output-dir", default="runs/wikitext103",
+                        help="Run directory; logs and checkpoints are stored inside")
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
     if args.total_batch_size <= 0 or (args.train_tokens is not None and args.train_tokens <= 0):
@@ -234,11 +254,13 @@ def parse_args():
         args.train_tokens = args.train_tokens if args.train_tokens is not None else 300_000_000
         args.max_steps = math.ceil(args.train_tokens / args.total_batch_size)
     if args.warmup_steps is None:
-        args.warmup_steps = min(args.max_steps - 1, math.ceil(args.max_steps * 0.03))
+        args.warmup_steps = min(
+            args.max_steps - 1, math.ceil(args.max_steps * 0.03))
     if any(value <= 0 for value in (args.batch_size, args.total_batch_size, args.max_steps, args.eval_interval, args.val_batches, args.checkpoint_interval)):
         parser.error("Batch sizes, steps and intervals must be positive")
     if not 1 <= args.seq_len <= 1024 or not 0 <= args.warmup_steps < args.max_steps:
-        parser.error("Require 1 <= seq-len <= 1024 and 0 <= warmup-steps < max-steps")
+        parser.error(
+            "Require 1 <= seq-len <= 1024 and 0 <= warmup-steps < max-steps")
     if args.max_lr <= 0 or (args.train_tokens is not None and args.train_tokens <= 0):
         parser.error("Learning rate and token budget must be positive")
     return args
@@ -283,7 +305,8 @@ def main():
     T = args.seq_len
     data_root = PROJECT_DIR / args.data_dir
     if not (data_root / "manifest.json").is_file():
-        raise FileNotFoundError("Run python wikitext.py first; complete manifest.json is required")
+        raise FileNotFoundError(
+            "Run python wikitext.py first; complete manifest.json is required")
     assert total_batch_size % (B*T*ddp_world_size) == 0
     grad_accum_steps = total_batch_size//(B*T*ddp_world_size)
     if master_process:
@@ -306,12 +329,10 @@ def main():
         model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model
 
-
     max_steps = args.max_steps
     max_lr = args.max_lr
     min_lr = max_lr*0.1
     warmup_steps = args.warmup_steps
-
 
     def get_lr(it):
         if it < warmup_steps:
@@ -323,7 +344,6 @@ def main():
         coeff = 0.5*(1.0+math.cos(math.pi*decay_ratio))
         return min_lr + coeff*(max_lr-min_lr)
 
-
     optimizer = raw_model.configure_optimizers(
         weight_decay=0.1, learning_rate=max_lr, device=device)
 
@@ -334,9 +354,12 @@ def main():
     os.makedirs(checkpoints_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"log.txt")
     if master_process:
-        (run_dir / "training_config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
-        print(f"dataset: WikiText-103; train tokens: {train_loader.total_tokens:,}; val tokens: {val_loader.total_tokens:,}")
-        print(f"planned updates: {max_steps}; planned training tokens: {max_steps * total_batch_size:,}")
+        (run_dir / "training_config.json").write_text(json.dumps(vars(args),
+                                                                 indent=2), encoding="utf-8")
+        print(
+            f"dataset: WikiText-103; train tokens: {train_loader.total_tokens:,}; val tokens: {val_loader.total_tokens:,}")
+        print(
+            f"planned updates: {max_steps}; planned training tokens: {max_steps * total_batch_size:,}")
         with open(log_file, "w") as f:
             pass
 
@@ -349,7 +372,8 @@ def main():
             with torch.no_grad():
                 val_loss_accum = 0.0
                 # WikiText validation is small: avoid cycling over it repeatedly.
-                val_loss_steps = min(args.val_batches, val_loader.total_tokens // (B*T*ddp_world_size))
+                val_loss_steps = min(
+                    args.val_batches, val_loader.total_tokens // (B*T*ddp_world_size))
                 for _ in range(val_loss_steps):
                     x, y = val_loader.next_batch()
                     x, y = x.to(device), y.to(device)
