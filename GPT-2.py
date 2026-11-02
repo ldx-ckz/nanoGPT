@@ -18,6 +18,45 @@ import numpy as np
 PROJECT_DIR = Path(__file__).resolve().parent
 
 
+class RoPE(nn.Module):
+    def __init__(self, config, base=10000.0):
+        super().__init__()
+        head_dim = config.n_embed//config.n_head
+        assert head_dim % 2 == 0
+        inv_freq = base**(
+            -torch.arange(0, head_dim, 2, dtype=torch.float32)
+            / head_dim
+        )
+        pos = torch.arange(config.block_size, dtype=torch.float32)
+        angels = pos[:, None]*inv_freq[None, :]
+        self.register_buffer(
+            "cos_cached",
+            angels.cos()[None, None, :, :],
+            persistent=False,
+        )
+        self.register_buffer(
+            "sin_cached",
+            angels.sin()[None, None, :, :],
+            persistent=False,
+        )
+
+    def forward(self, x):
+        T = x.size(-2)
+        assert T <= self.cos_cached.size(-2)
+        cos = self.cos_cached[:, :, :T, :]
+        sin = self.sin_cached[:, :, :T, :]
+        x_float = x.float()
+        x_even = x_float[..., 0::2]
+        x_odd = x_float[..., 0::2]
+        rot_even = x_even*cos-x_odd*sin
+        rot_odd = x_even*sin+x_odd*cos
+
+        rot = torch.stack(
+            (rot_even, rot_odd), dim=-1
+        ).flatten(-2)
+        return rot.to(dtype=x.dtype)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -25,6 +64,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embed, config.n_embed*3, bias=False)
         self.c_proj = nn.Linear(config.n_embed, config.n_embed, bias=False)
         self.c_proj.GPT2_SCALE_INIT = 1
+        self.rope = RoPE(config)
         self.n_head = config.n_head
         self.n_embed = config.n_embed
 
@@ -35,6 +75,8 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
+        q = self.rope(q)
+        k = self.repe(k)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
@@ -109,7 +151,6 @@ class GPT(nn.Module):
         self.config = config
         self.transformer = nn.ModuleDict(dict(
             wte=nn.Embedding(config.vocab_size, config.n_embed),
-            wpe=nn.Embedding(config.block_size, config.n_embed),
             h=nn.ModuleList([Block(config) for _ in range(config.n_layers)]),
             ln_f=RMSNorm(config.n_embed),
         ))
@@ -132,10 +173,7 @@ class GPT(nn.Module):
         B, T = idx.size()
         assert T <= self.config.block_size, (f"Cannot forward sequence of length {T}, "
                                              f"block size is only {self.config.block_size}")
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-        pos_emb = self.transformer.wpe(pos)
-        tok_emb = self.transformer.wte(idx)
-        x = tok_emb + pos_emb
+        x = self.transformer.wte(idx)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
