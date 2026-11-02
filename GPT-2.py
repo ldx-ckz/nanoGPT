@@ -22,8 +22,8 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embed % config.n_head == 0
-        self.c_attn = nn.Linear(config.n_embed, config.n_embed*3)
-        self.c_proj = nn.Linear(config.n_embed, config.n_embed)
+        self.c_attn = nn.Linear(config.n_embed, config.n_embed*3, bias=False)
+        self.c_proj = nn.Linear(config.n_embed, config.n_embed, bias=False)
         self.c_proj.GPT2_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embed = config.n_embed
@@ -41,19 +41,32 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+class SwiGLU(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        dim = config.n_embed
+        hidden_dim = 8 * dim // 3
+
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+
+        self.down_proj.GPT2_SCALE_INIT = 1
+
+    def forward(self, x):
+        gate = F.silu(self.gate_proj(x))
+        value = self.up_proj(x)
+        return self.down_proj(gate * value)
+
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embed, 4*config.n_embed)
-        self.gelu = nn.GELU(approximate='tanh')
-        self.c_proj = nn.Linear(4*config.n_embed, config.n_embed)
-        self.c_proj.GPT2_SCALE_INIT = 1
+        self.swg = SwiGLU(config)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        return x
+        return self.swg(x)
 
 
 class RMSNorm(nn.Module):
