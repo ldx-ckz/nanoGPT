@@ -63,7 +63,7 @@ WikiText defaults:
 
 | Option | Value |
 | --- | --- |
-| Model | Original GPT-2: 12 layers, 12 heads, width 768, vocabulary 50304 |
+| Model | GPT-2 variant: RMSNorm, SwiGLU, RoPE; 12 layers, 12 heads, width 768, vocabulary 50304 |
 | Per-GPU batch / sequence length | 16 / 1024 |
 | Global batch | 65536 tokens (two accumulation steps on two GPUs) |
 | Training token budget | 300,000,000, rounded up to 4578 updates / 300,023,808 tokens |
@@ -91,3 +91,6 @@ Only train and val are read during training. The held-out test shards are for
 final evaluation. The logged validation loss is a fixed-batch training monitor,
 not full-test sliding-window perplexity or a published word-level WikiText score.
 Article EOT/newline handling is part of this repository's preprocessing protocol.
+
+For TinyStories preparation, `--dataset` switching and autoregressive prediction
+with KV-cache timing/memory logs, see [prediction.md](prediction.md).

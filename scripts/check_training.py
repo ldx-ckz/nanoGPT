@@ -89,7 +89,7 @@ def check_optimizer_and_checkpoint(namespace):
     parameter = model.transformer.h[0].attn.c_attn.weight
     before = parameter.detach().clone()
     with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda"):
-        _, loss = model(x, y)
+        _, loss, _ = model(x, y, past_kv=None, use_cache=False)
     assert torch.isfinite(loss), "Nonfinite loss"
     loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -98,7 +98,7 @@ def check_optimizer_and_checkpoint(namespace):
     assert not torch.equal(before, parameter), "Optimizer did not update weights"
     model.eval()
     with torch.no_grad():
-        expected, _ = model(x)
+        expected, _, _ = model(x, past_kv=None, use_cache=False)
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "checkpoint.pt"
         torch.save({"model": model.state_dict(), "config": asdict(config)}, path)
@@ -107,19 +107,20 @@ def check_optimizer_and_checkpoint(namespace):
         restored.load_state_dict(checkpoint["model"])
         restored.eval()
         with torch.no_grad():
-            actual, _ = restored(x)
+            actual, _, _ = restored(x, past_kv=None, use_cache=False)
         torch.testing.assert_close(actual, expected)
     print(f"Small-model forward/backward, AdamW update and weight reload OK on {device}")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", choices=("wikitext", "tinystory"), default="wikitext")
     parser.add_argument("--data-dir", type=Path)
     args = parser.parse_args()
     print(f"Python: {sys.executable}")
     print(f"PyTorch: {torch.__version__}; visible CUDA GPUs: {torch.cuda.device_count()}")
     namespace = load_training_definitions()
-    data_root = args.data_dir or PROJECT_DIR / "wikitext103"
+    data_root = args.data_dir or PROJECT_DIR / namespace["DATA_DIRS"][args.dataset]
     check_shards(data_root)
     check_rank_boundaries(namespace)
     check_optimizer_and_checkpoint(namespace)

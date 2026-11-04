@@ -47,7 +47,7 @@ def tokenize(text):
     return tokens.astype(np.uint16)
 
 
-def write_split(tokenized_articles, output_dir, split, shard_size):
+def write_split(tokenized_articles, output_dir, split, shard_size, prefix="wikitext"):
     """Split even very long articles across any number of shards, without loss."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -58,7 +58,7 @@ def write_split(tokenized_articles, output_dir, split, shard_size):
     files = []
 
     def flush(length):
-        filename = f"wikitext_{split}_{len(files):06d}.npy"
+        filename = f"{prefix}_{split}_{len(files):06d}.npy"
         path = output_dir / filename
         temporary = path.with_suffix(".npy.tmp")
         with temporary.open("wb") as file:

@@ -67,7 +67,7 @@ class WikiTextTests(unittest.TestCase):
         self.assertEqual((wiki.max_steps, wiki.total_batch_size), (4578, 65536))
         self.assertEqual(wiki.data_dir, "wikitext103")
         self.assertEqual(wiki.output_dir, "runs/wikitext103")
-        self.assertFalse(hasattr(wiki, "dataset"))
+        self.assertEqual(wiki.dataset, "wikitext")
         self.assertFalse(hasattr(wiki, "hellaswag"))
         self.assertFalse(hasattr(training, "iterate_examples"))
         self.assertLess(wiki.warmup_steps, wiki.max_steps)

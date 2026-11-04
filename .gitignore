@@ -16,6 +16,7 @@ data/raw/
 data/processed/
 edu_fineweb10B/
 wikitext103/
+tinystories/
 /hellaswag/
 *.npy
 *.npz

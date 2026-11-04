@@ -40,14 +40,15 @@ class RoPE(nn.Module):
             persistent=False,
         )
 
-    def forward(self, x):
+    def forward(self, x, offset=0):
         T = x.size(-2)
-        assert T <= self.cos_cached.size(-2)
-        cos = self.cos_cached[:, :, :T, :]
-        sin = self.sin_cached[:, :, :T, :]
+        end = T+offset
+        assert end <= self.cos_cached.size(-2)
+        cos = self.cos_cached[:, :, offset:end, :]
+        sin = self.sin_cached[:, :, offset:end, :]
         x_float = x.float()
         x_even = x_float[..., 0::2]
-        x_odd = x_float[..., 0::2]
+        x_odd = x_float[..., 1::2]
         rot_even = x_even*cos-x_odd*sin
         rot_odd = x_even*sin+x_odd*cos
 
@@ -68,19 +69,34 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embed = config.n_embed
 
-    def forward(self, x):
+    def forward(self, x, past_kv=None, use_cache=False):
         B, T, C = x.size()
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embed, dim=-1)
         q = q.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
-        q = self.rope(q)
-        k = self.repe(k)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        past_len = 0 if past_kv is None else past_kv[0].size(-2)
+        q = self.rope(q, offset=past_len)
+        k = self.rope(k, offset=past_len)
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat((past_k, k), dim=-2)
+            v = torch.cat((past_v, v), dim=-2)
+        new_cache = (k, v) if use_cache else None
+        if past_len == 0:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        elif T == 1:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        else:
+            q_pos = past_len+torch.arange(T, device=x.device)
+            k_pos = torch.arange(k.size(-2), device=x.device)
+            mask = k_pos[None, :] <= q_pos[:, None]
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, is_causal=False)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
-        return y
+        return y, new_cache
 
 
 class SwiGLU(nn.Module):
@@ -130,10 +146,12 @@ class Block(nn.Module):
         self.ln_2 = RMSNorm(config.n_embed)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, past_kv=None, use_cache=False):
+        attn_out, new_cache = self.attn(
+            self.ln_1(x), past_kv=past_kv, use_cache=use_cache)
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, new_cache
 
 
 @dataclass
@@ -169,20 +187,37 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, past_kv=None, use_cache=False):
         B, T = idx.size()
-        assert T <= self.config.block_size, (f"Cannot forward sequence of length {T}, "
-                                             f"block size is only {self.config.block_size}")
+        n_layers = len(self.transformer.h)
+        if past_kv is None:
+            past_kv = [None]*n_layers
+        else:
+            assert len(past_kv) == n_layers
+
+        past_lengths = [
+            0 if cache is None else cache[0].size(-2)
+            for cache in past_kv
+        ]
+        assert len(set(past_lengths)) == 1
+        past_len = past_lengths[0]
+
+        assert past_len+T <= self.config.block_size, (f"Cannot forward sequence of length {past_len+T}, "
+                                                      f"block size is only {self.config.block_size}")
         x = self.transformer.wte(idx)
-        for block in self.transformer.h:
-            x = block(x)
+        new_past_kv = [] if use_cache else None
+        for layer_idx, block in enumerate(self.transformer.h):
+            x, layer_cache = block(
+                x, past_kv=past_kv[layer_idx], use_cache=use_cache)
+            if use_cache:
+                new_past_kv.append(layer_cache)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss
+        return logits, loss, new_past_kv
 
     def configure_optimizers(self, weight_decay, learning_rate, device):
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -429,7 +464,7 @@ def main():
                     x, y = val_loader.next_batch()
                     x, y = x.to(device), y.to(device)
                     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, loss = model(x, y)
+                        logits, loss, _ = model(x, y)
                     loss = loss/val_loss_steps
                     val_loss_accum += loss.detach()
             if ddp:
@@ -449,7 +484,7 @@ def main():
                 model.require_backward_grad_sync = (
                     micro_step == grad_accum_steps-1)
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits, loss = model(x, y)
+                logits, loss, _ = model(x, y)
             loss = loss/grad_accum_steps
             loss_accum += loss.detach()
             loss.backward()
