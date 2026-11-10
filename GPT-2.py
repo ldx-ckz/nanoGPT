@@ -134,7 +134,8 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        normalized = x.float() * torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + self.eps)
+        normalized = x.float() * torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True)
+                                             + self.eps)
         return (normalized * self.weight).to(x.dtype)
 
 
@@ -305,7 +306,6 @@ class DataLoaderLite:
         buf = self._read_tokens(self.position + B*T*self.process_rank, B*T + 1)
         x = (buf[:-1]).view(B, T)
         y = (buf[1:]).view(B, T)
-        # All ranks advance the same global token cursor, including across short tails.
         self.position = (self.position + B*T *
                          self.num_processes) % self.total_tokens
         return x, y
@@ -313,7 +313,7 @@ class DataLoaderLite:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train the GPT-2 baseline on WikiText-103")
+        description="Train the GPT baseline on WikiText-103")
     parser.add_argument("--data-dir", default="wikitext103",
                         help="Shard directory, relative to the project or absolute")
     parser.add_argument("--batch-size", type=int,
@@ -408,8 +408,7 @@ def main():
 
     model = GPT(GPTConfig(vocab_size=50304))
     model.to(device)
-    use_compile = False
-    if use_compile:
+    if os.environ.get("TORCH_COMPILE_DISABLE") != "1":
         model = torch.compile(model)
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
@@ -443,7 +442,7 @@ def main():
         (run_dir / "training_config.json").write_text(json.dumps(vars(args),
                                                                  indent=2), encoding="utf-8")
         print(
-            f"dataset: WikiText-103; train tokens: {train_loader.total_tokens:,}; val tokens: {val_loader.total_tokens:,}")
+            f"dataset: {data_root.name}; train tokens: {train_loader.total_tokens:,}; val tokens: {val_loader.total_tokens:,}")
         print(
             f"planned updates: {max_steps}; planned training tokens: {max_steps * total_batch_size:,}")
         with open(log_file, "w") as f:
@@ -457,7 +456,6 @@ def main():
             val_loader.reset()
             with torch.no_grad():
                 val_loss_accum = 0.0
-                # WikiText validation is small: avoid cycling over it repeatedly.
                 val_loss_steps = min(
                     args.val_batches, val_loader.total_tokens // (B*T*ddp_world_size))
                 for _ in range(val_loss_steps):

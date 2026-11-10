@@ -18,6 +18,10 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
+DATA_DIRS = {
+    "wikitext": "wikitext103",
+    "tinystory": "tinystories",
+}
 sys.path.insert(0, str(PROJECT_DIR))
 
 
@@ -47,9 +51,11 @@ def check_shards(data_root, splits=("train", "val", "test")):
             total_tokens += len(tokens)
             split_tokens += len(tokens)
             del tokens
-        assert split_tokens >= 16 * 1024 * 2 + 1, f"Split too short for default two-GPU batch: {split}"
+        assert split_tokens >= 16 * 1024 * 2 + \
+            1, f"Split too short for default two-GPU batch: {split}"
         counts[split] = len(paths)
-    print(f"Shard headers and token samples OK: {counts}, {total_tokens:,} total tokens")
+    print(
+        f"Shard headers and token samples OK: {counts}, {total_tokens:,} total tokens")
 
 
 def check_rank_boundaries(namespace):
@@ -63,12 +69,14 @@ def check_rank_boundaries(namespace):
         original_root = namespace["PROJECT_DIR"]
         namespace["PROJECT_DIR"] = root
         try:
-            loaders = [loader_type(2, 4, rank, 2, "train") for rank in range(2)]
+            loaders = [loader_type(2, 4, rank, 2, "train")
+                       for rank in range(2)]
             stream = torch.cat([torch.arange(51), torch.arange(100, 151)])
             for batch in range(12):
                 for rank, loader in enumerate(loaders):
                     x, y = loader.next_batch()
-                    indices = (torch.arange(9) + batch * 16 + rank * 8) % len(stream)
+                    indices = (torch.arange(9) + batch *
+                               16 + rank * 8) % len(stream)
                     expected = stream[indices]
                     assert torch.equal(x.flatten(), expected[:-1])
                     assert torch.equal(y.flatten(), expected[1:])
@@ -95,32 +103,38 @@ def check_optimizer_and_checkpoint(namespace):
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     assert torch.isfinite(norm), "Nonfinite gradients"
     optimizer.step()
-    assert not torch.equal(before, parameter), "Optimizer did not update weights"
+    assert not torch.equal(
+        before, parameter), "Optimizer did not update weights"
     model.eval()
     with torch.no_grad():
         expected, _, _ = model(x, past_kv=None, use_cache=False)
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "checkpoint.pt"
-        torch.save({"model": model.state_dict(), "config": asdict(config)}, path)
+        torch.save({"model": model.state_dict(),
+                   "config": asdict(config)}, path)
         checkpoint = torch.load(path, map_location=device, weights_only=True)
-        restored = namespace["GPT"](namespace["GPTConfig"](**checkpoint["config"])).to(device)
+        restored = namespace["GPT"](namespace["GPTConfig"](
+            **checkpoint["config"])).to(device)
         restored.load_state_dict(checkpoint["model"])
         restored.eval()
         with torch.no_grad():
             actual, _, _ = restored(x, past_kv=None, use_cache=False)
         torch.testing.assert_close(actual, expected)
-    print(f"Small-model forward/backward, AdamW update and weight reload OK on {device}")
+    print(
+        f"Small-model forward/backward, AdamW update and weight reload OK on {device}")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", choices=("wikitext", "tinystory"), default="wikitext")
+    parser.add_argument("--dataset", choices=("wikitext",
+                        "tinystory"), default="wikitext")
     parser.add_argument("--data-dir", type=Path)
     args = parser.parse_args()
     print(f"Python: {sys.executable}")
-    print(f"PyTorch: {torch.__version__}; visible CUDA GPUs: {torch.cuda.device_count()}")
+    print(
+        f"PyTorch: {torch.__version__}; visible CUDA GPUs: {torch.cuda.device_count()}")
     namespace = load_training_definitions()
-    data_root = args.data_dir or PROJECT_DIR / namespace["DATA_DIRS"][args.dataset]
+    data_root = PROJECT_DIR / (args.data_dir or DATA_DIRS[args.dataset])
     check_shards(data_root)
     check_rank_boundaries(namespace)
     check_optimizer_and_checkpoint(namespace)

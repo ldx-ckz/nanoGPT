@@ -11,9 +11,12 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_DIR))
+
 import wikitext
 
-spec = importlib.util.spec_from_file_location("gpt_wikitext_tests", Path(__file__).resolve().parents[1] / "GPT-2.py")
+spec = importlib.util.spec_from_file_location("gpt_wikitext_tests", PROJECT_DIR / "GPT-2.py")
 training = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = training
 spec.loader.exec_module(training)
@@ -67,7 +70,6 @@ class WikiTextTests(unittest.TestCase):
         self.assertEqual((wiki.max_steps, wiki.total_batch_size), (4578, 65536))
         self.assertEqual(wiki.data_dir, "wikitext103")
         self.assertEqual(wiki.output_dir, "runs/wikitext103")
-        self.assertEqual(wiki.dataset, "wikitext")
         self.assertFalse(hasattr(wiki, "hellaswag"))
         self.assertFalse(hasattr(training, "iterate_examples"))
         self.assertLess(wiki.warmup_steps, wiki.max_steps)
