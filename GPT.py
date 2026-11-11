@@ -19,9 +19,10 @@ PROJECT_DIR = Path(__file__).resolve().parent
 
 
 class RoPE(nn.Module):
-    def __init__(self, config, base=10000.0):
+    def __init__(self, config, base=10000.0, head_dim=None):
         super().__init__()
-        head_dim = config.n_embed//config.n_head
+        if head_dim is None:
+            head_dim = config.n_embed//config.n_head
         assert head_dim % 2 == 0
         inv_freq = base**(
             -torch.arange(0, head_dim, 2, dtype=torch.float32)
@@ -62,28 +63,71 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embed % config.n_head == 0
-        self.c_attn = nn.Linear(config.n_embed, config.n_embed*3, bias=False)
-        self.c_proj = nn.Linear(config.n_embed, config.n_embed, bias=False)
-        self.c_proj.GPT2_SCALE_INIT = 1
-        self.rope = RoPE(config)
         self.n_head = config.n_head
         self.n_embed = config.n_embed
+        self.head_dim = config.n_embed//config.n_head
+        self.use_mla = config.attention == "mla"
+        if self.use_mla:
+            self.kv_rank = config.mla_kv_rank
+            self.rope_dim = config.mla_rope_dim
+            assert self.kv_rank > 0
+            assert 0 < self.rope_dim < self.head_dim
+            assert self.rope_dim % 2 == 0
+            self.cont_dim = self.head_dim-self.rope_dim
+            self.q_proj = nn.Linear(self.n_embed, self.n_embed, bias=False)
+            self.kv_down = nn.Linear(
+                self.n_embed, self.kv_rank+self.rope_dim, bias=False)
+            self.kv_norm = RMSNorm(self.kv_rank)
+            self.kv_up = nn.Linear(self.kv_rank, self.n_head*(
+                self.cont_dim+self.head_dim), bias=False)
+        else:
+            self.c_attn = nn.Linear(
+                config.n_embed, config.n_embed*3, bias=False)
+        self.c_proj = nn.Linear(config.n_embed, config.n_embed, bias=False)
+        self.c_proj.GPT2_SCALE_INIT = 1
+        self.rope = RoPE(
+            config, head_dim=self.rope_dim if self.use_mla else None)
+
+    def _mla_qkv(self, x, past_kv, past_len, use_cache):
+        B, T, _ = x.size()
+        q = self.q_proj(x).view(B, T, self.n_head,
+                                self.head_dim).transpose(1, 2)
+        q_cont, q_rope = q.split((self.cont_dim, self.rope_dim), dim=-1)
+        q_rope = self.rope(q_rope, offset=past_len)
+        latent, k_rope = self.kv_down(x).split(
+            (self.kv_rank, self.rope_dim), dim=-1)
+        latent = self.kv_norm(latent)
+        k_rope = self.rope(k_rope.unsqueeze(1), offset=past_len)
+        if past_kv is not None:
+            past_latent, past_k_rope = past_kv
+            latent = torch.cat((past_latent, latent), dim=-2)
+            k_rope = torch.cat((past_k_rope, k_rope), dim=-2)
+        new_cache = (latent, k_rope) if use_cache else None
+        S = latent.size(-2)
+        kv = self.kv_up(latent).reshape(B, S, self.n_head, -1).transpose(1, 2)
+        k_cont, v = kv.split((self.cont_dim, self.head_dim), dim=-1)
+        q = torch.cat((q_cont, q_rope), dim=-1)
+        k = torch.cat((k_cont, k_rope.expand(-1, self.n_head, -1, -1)), dim=-1)
+        return q, k, v, new_cache
 
     def forward(self, x, past_kv=None, use_cache=False):
         B, T, C = x.size()
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embed, dim=-1)
-        q = q.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
-        k = k.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
         past_len = 0 if past_kv is None else past_kv[0].size(-2)
-        q = self.rope(q, offset=past_len)
-        k = self.rope(k, offset=past_len)
-        if past_kv is not None:
-            past_k, past_v = past_kv
-            k = torch.cat((past_k, k), dim=-2)
-            v = torch.cat((past_v, v), dim=-2)
-        new_cache = (k, v) if use_cache else None
+        if self.use_mla:
+            q, k, v, new_cache = self._mla_qkv(x, past_kv, past_len, use_cache)
+        else:
+            qkv = self.c_attn(x)
+            q, k, v = qkv.split(self.n_embed, dim=-1)
+            q = q.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
+            k = k.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
+            v = v.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
+            q = self.rope(q, offset=past_len)
+            k = self.rope(k, offset=past_len)
+            if past_kv is not None:
+                past_k, past_v = past_kv
+                k = torch.cat((past_k, k), dim=-2)
+                v = torch.cat((past_v, v), dim=-2)
+            new_cache = (k, v) if use_cache else None
         if past_len == 0:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         elif T == 1:
@@ -162,6 +206,9 @@ class GPTConfig:
     n_layers: int = 12
     n_head: int = 12
     n_embed: int = 768
+    attention: str = "mha"
+    mla_kv_rank: int = 192
+    mla_rope_dim: int = 16
 
 
 class GPT(nn.Module):
@@ -333,6 +380,7 @@ def parse_args():
     parser.add_argument("--output-dir", default="runs/wikitext103",
                         help="Run directory; logs and checkpoints are stored inside")
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--attention", choices=("mha", "mla"), default="mha")
     args = parser.parse_args()
     if args.total_batch_size <= 0 or (args.train_tokens is not None and args.train_tokens <= 0):
         parser.error("Global batch size and token budget must be positive")
@@ -406,7 +454,7 @@ def main():
 
     torch.set_float32_matmul_precision('high')
 
-    model = GPT(GPTConfig(vocab_size=50304))
+    model = GPT(GPTConfig(vocab_size=50304, attention=args.attention))
     model.to(device)
     if os.environ.get("TORCH_COMPILE_DISABLE") != "1":
         model = torch.compile(model)

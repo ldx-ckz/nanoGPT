@@ -1,3 +1,4 @@
+import importlib.util
 import json
 from pathlib import Path
 import sys
@@ -11,55 +12,79 @@ import numpy as np
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
-import predict
+import GPT as training
 import tinystories
-
-training = predict.training
 
 
 class KVCacheTests(unittest.TestCase):
-    def setUp(self):
+    def make_model(self, attention):
         torch.manual_seed(1337)
-        self.model = training.GPT(training.GPTConfig(block_size=24, vocab_size=128,
-                                                     n_layers=2, n_head=2, n_embed=32)).eval()
+        return training.GPT(training.GPTConfig(
+            block_size=24, vocab_size=128, n_layers=2, n_head=2, n_embed=32,
+            attention=attention, mla_kv_rank=8, mla_rope_dim=4,
+        )).eval()
 
     def test_prefill_single_token_and_chunk_decode_match_full_forward(self):
-        tokens = torch.randint(128, (3, 16))
-        with torch.inference_mode():
-            full, _, empty = self.model(tokens, past_kv=None, use_cache=False)
-            self.assertIsNone(empty)
-            for lengths in ([4] + [1] * 12, [3, 5, 8]):
-                cache = None
-                offset = 0
-                parts = []
-                for length in lengths:
-                    out, _, cache = self.model(
-                        tokens[:, offset:offset+length], past_kv=cache, use_cache=True)
-                    offset += length
-                    self.assertTrue(
-                        all(k.shape == (3, 2, offset, 16) and v.shape == k.shape for k, v in cache))
-                    parts.append(out)
-                torch.testing.assert_close(
-                    torch.cat(parts, 1), full, atol=1e-6, rtol=1e-5)
-            changed = tokens.clone()
-            changed[:, 8:] = (changed[:, 8:] + 1) % 128
-            out, _, _ = self.model(changed)
-            torch.testing.assert_close(full[:, :8], out[:, :8])
-
+        tokens = torch.randint(128, (3, 16), generator=torch.Generator().manual_seed(1337))
+        for attention in ("mha", "mla"):
+            with self.subTest(attention=attention), torch.inference_mode():
+                model = self.make_model(attention)
+                full, _, empty = model(tokens, use_cache=False)
+                self.assertIsNone(empty)
+                for lengths in ([4] + [1] * 12, [3, 5, 8]):
+                    cache = None
+                    offset = 0
+                    parts = []
+                    for length in lengths:
+                        out, _, cache = model(
+                            tokens[:, offset:offset + length], past_kv=cache, use_cache=True)
+                        offset += length
+                        self.assertEqual(len(cache), model.config.n_layers)
+                        if attention == "mla":
+                            expected = ((3, offset, 8), (3, 1, offset, 4))
+                        else:
+                            expected = ((3, 2, offset, 16),) * 2
+                        for layer_cache in cache:
+                            self.assertEqual(tuple(t.shape for t in layer_cache), expected)
+                        parts.append(out)
+                    torch.testing.assert_close(
+                        torch.cat(parts, 1), full, atol=1e-6, rtol=1e-5)
+                changed = tokens.clone()
+                changed[:, 8:] = (changed[:, 8:] + 1) % 128
+                out, _, _ = model(changed)
+                torch.testing.assert_close(full[:, :8], out[:, :8])
 
     def test_predict_benchmark_reuses_prefix_and_preserves_greedy_output(self):
-        prompt = torch.tensor([[1, 2, 3]])
-        result = predict.benchmark(self.model, prompt, new_tokens=6, repeats=1, warmup=0)
-        self.assertTrue(result["output_tokens_equal"])
-        self.assertEqual(len(result["runs"]), 2)
+        # Keep exercising benchmark() while predict.py still names the old model file.
+        make_spec = importlib.util.spec_from_file_location
 
-        no_cache, cached = result["runs"]
-        self.assertFalse(no_cache["use_cache"])
-        self.assertTrue(cached["use_cache"])
-        self.assertEqual(len(cached["token_ids"]), 9)
-        self.assertEqual([step["forward_tokens"] for step in no_cache["steps"]], list(range(3, 9)))
-        self.assertEqual([step["forward_tokens"] for step in cached["steps"]], [3, 1, 1, 1, 1, 1])
-        self.assertEqual([step["cached_tokens"] for step in cached["steps"]], list(range(3, 9)))
+        def model_spec(name, location, *args, **kwargs):
+            if name == "prediction_training" and location == PROJECT_DIR / "GPT-2.py":
+                location = PROJECT_DIR / "GPT.py"
+            return make_spec(name, location, *args, **kwargs)
+
+        with patch.object(importlib.util, "spec_from_file_location", side_effect=model_spec):
+            import predict
+
+        prompt = torch.tensor([[1, 2, 3]])
+        for attention, elements_per_token in (("mha", 2 * 2 * 16), ("mla", 8 + 4)):
+            with self.subTest(attention=attention):
+                model = self.make_model(attention)
+                result = predict.benchmark(model, prompt, new_tokens=6, repeats=1, warmup=0)
+                self.assertTrue(result["output_tokens_equal"])
+                self.assertEqual(len(result["runs"]), 2)
+
+                no_cache, cached = result["runs"]
+                self.assertFalse(no_cache["use_cache"])
+                self.assertTrue(cached["use_cache"])
+                self.assertEqual(len(cached["token_ids"]), 9)
+                self.assertEqual([step["forward_tokens"] for step in no_cache["steps"]], list(range(3, 9)))
+                self.assertEqual([step["forward_tokens"] for step in cached["steps"]], [3, 1, 1, 1, 1, 1])
+                self.assertEqual([step["cached_tokens"] for step in cached["steps"]], list(range(3, 9)))
+                self.assertEqual(no_cache["logical_cache_bytes"], 0)
+                self.assertEqual(cached["logical_cache_bytes"],
+                                 8 * model.config.n_layers * elements_per_token *
+                                 model.transformer.wte.weight.element_size())
 
 
 class TinyStoriesTests(unittest.TestCase):
