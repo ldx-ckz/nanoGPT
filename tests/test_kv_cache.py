@@ -1,4 +1,6 @@
-import importlib.util
+import contextlib
+from dataclasses import asdict
+import io
 import json
 from pathlib import Path
 import sys
@@ -13,6 +15,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
 import GPT as training
+import predict
 import tinystories
 
 
@@ -55,17 +58,6 @@ class KVCacheTests(unittest.TestCase):
                 torch.testing.assert_close(full[:, :8], out[:, :8])
 
     def test_predict_benchmark_reuses_prefix_and_preserves_greedy_output(self):
-        # Keep exercising benchmark() while predict.py still names the old model file.
-        make_spec = importlib.util.spec_from_file_location
-
-        def model_spec(name, location, *args, **kwargs):
-            if name == "prediction_training" and location == PROJECT_DIR / "GPT-2.py":
-                location = PROJECT_DIR / "GPT.py"
-            return make_spec(name, location, *args, **kwargs)
-
-        with patch.object(importlib.util, "spec_from_file_location", side_effect=model_spec):
-            import predict
-
         prompt = torch.tensor([[1, 2, 3]])
         for attention, elements_per_token in (("mha", 2 * 2 * 16), ("mla", 8 + 4)):
             with self.subTest(attention=attention):
@@ -85,6 +77,29 @@ class KVCacheTests(unittest.TestCase):
                 self.assertEqual(cached["logical_cache_bytes"],
                                  8 * model.config.n_layers * elements_per_token *
                                  model.transformer.wte.weight.element_size())
+
+    def test_predict_cli_loads_current_and_legacy_compiled_checkpoints(self):
+        model = self.make_model("mla")
+        for prefix in ("", "_orig_mod."):
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                checkpoint_path = root / "model.pt"
+                torch.save({
+                    "config": asdict(model.config),
+                    "model": {prefix + key: value for key, value in model.state_dict().items()},
+                    "training_config": {"data_dir": r"C:\data\tinystories"},
+                }, checkpoint_path)
+                output = root / "prediction"
+                argv = [
+                    "predict.py", "--checkpoint", str(checkpoint_path),
+                    "--prompt", "!", "--max-new-tokens", "2", "--device", "cpu",
+                    "--repeats", "1", "--warmup", "0", "--output-dir", str(output),
+                ]
+                with patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                    predict.main()
+                summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+                self.assertEqual(summary["dataset"], "tinystory")
+                self.assertTrue(summary["output_tokens_equal"])
 
 
 class TinyStoriesTests(unittest.TestCase):

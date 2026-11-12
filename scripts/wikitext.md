@@ -50,13 +50,13 @@ python scripts/check_training.py
 Linux, two NVIDIA GPUs:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 GPT-2.py --output-dir runs/wiki_baseline_seed1337
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 GPT.py --output-dir runs/wiki_baseline_seed1337
 ```
 
 Single GPU:
 
 ```bash
-python GPT-2.py --output-dir runs/wiki_baseline_seed1337
+python GPT.py --output-dir runs/wiki_baseline_seed1337
 ```
 
 WikiText defaults:
@@ -76,7 +76,7 @@ WikiText defaults:
 Override the budget or learning rate, for example:
 
 ```bash
-python GPT-2.py --train-tokens 50000000 --max-lr 3e-4 --output-dir runs/wiki_pilot_seed1337
+python GPT.py --train-tokens 50000000 --max-lr 3e-4 --output-dir runs/wiki_pilot_seed1337
 ```
 
 `--max-steps` can replace `--train-tokens`; they cannot be supplied together.
@@ -92,5 +92,5 @@ final evaluation. The logged validation loss is a fixed-batch training monitor,
 not full-test sliding-window perplexity or a published word-level WikiText score.
 Article EOT/newline handling is part of this repository's preprocessing protocol.
 
-For TinyStories preparation, `--dataset` switching and autoregressive prediction
+For TinyStories preparation, dataset selection and autoregressive prediction
 with KV-cache timing/memory logs, see [prediction.md](prediction.md).

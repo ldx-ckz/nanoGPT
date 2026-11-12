@@ -27,13 +27,12 @@ WikiText files live in `wikitext103/`; TinyStories files in `tinystories/`.
 ## Train (Linux, two GPUs)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 GPT-2.py --dataset wikitext
-CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 GPT-2.py --dataset tinystory --train-tokens 150000000
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 GPT.py
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 GPT.py --data-dir tinystories --output-dir runs/tinystories --train-tokens 150000000
 ```
 
-Without --dataset the default remains wikitext. Default run directories are
-`runs/wikitext103/` and `runs/tinystories/`; use --output-dir for separate runs.
-The training defaults otherwise remain the same. TinyStories preprocessing's
+Training defaults to `--data-dir wikitext103` and `--output-dir runs/wikitext103`.
+Set both options as shown above for TinyStories. TinyStories preprocessing's
 50M unique-token subset is distinct from the cumulative training token budget:
 150M training tokens is roughly three passes; the default 300M is roughly six.
 Only train/val are read in training; test is held out.

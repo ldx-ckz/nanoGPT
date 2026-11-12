@@ -1,7 +1,7 @@
 import contextlib
-import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -11,13 +11,11 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-import wikitext
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_DIR))
 
-spec = importlib.util.spec_from_file_location(
-    "gpt_wikitext_tests", Path(__file__).resolve().parents[1] / "GPT-2.py")
-training = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = training
-spec.loader.exec_module(training)
+import GPT as training
+import wikitext
 
 
 class WikiTextTests(unittest.TestCase):
@@ -70,7 +68,7 @@ class WikiTextTests(unittest.TestCase):
             self.assertEqual(loaders[0].next_batch()[0].tolist(), [[0, 1]])
 
     def test_defaults_use_only_wikitext_and_bound_token_budget(self):
-        with patch.object(sys, "argv", ["GPT-2.py"]):
+        with patch.object(sys, "argv", ["GPT.py"]):
             wiki = training.parse_args()
         self.assertEqual(
             (wiki.max_steps, wiki.total_batch_size), (4578, 65536))
@@ -114,18 +112,21 @@ class WikiTextTests(unittest.TestCase):
                 models.append(model)
                 return model
 
-            argv = ["GPT-2.py", "--data-dir", str(root),
+            argv = ["GPT.py", "--data-dir", str(root),
                     "--output-dir", str(root /
                                         "run"), "--max-steps", "2", "--warmup-steps", "0",
                     "--batch-size", "1", "--seq-len", "8", "--total-batch-size", "16", "--val-batches", "1"]
+            compile_model = torch.compile
             with (
                 patch.object(sys, "argv", argv),
                 patch.object(training, "GPT", side_effect=small_model),
+                patch.dict(os.environ, {"TORCH_COMPILE_DISABLE": "0"}),
                 patch.object(torch, "compile",
-                             side_effect=lambda model: model),
+                             side_effect=lambda model: compile_model(model, backend="eager")) as compile_mock,
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 training.main()
+            compile_mock.assert_called_once_with(models[0])
             checkpoint = torch.load(
                 root / "run/checkpoints/model_00002.pt", map_location="cpu", weights_only=True)
             self.assertEqual(checkpoint["completed_steps"], 2)

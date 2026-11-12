@@ -16,6 +16,10 @@ import inspect
 import numpy as np
 
 PROJECT_DIR = Path(__file__).resolve().parent
+DATA_DIRS = {
+    "wikitext": "wikitext103",
+    "tinystory": "tinystories",
+}
 
 
 class RoPE(nn.Module):
@@ -464,7 +468,7 @@ class DataLoaderLite:
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train the GPT baseline on WikiText-103")
-    parser.add_argument("--data-dir", default="wikitext103",
+    parser.add_argument("--data-dir", default=DATA_DIRS["wikitext"],
                         help="Shard directory, relative to the project or absolute")
     parser.add_argument("--batch-size", type=int,
                         default=16, help="Sequences per GPU")
@@ -562,13 +566,14 @@ def main():
 
     torch.set_float32_matmul_precision('high')
 
-    model = GPT(GPTConfig(vocab_size=50304, attention=args.attention,dsa_topk=args.dsa_topk,))
-    model.to(device)
+    raw_model = GPT(GPTConfig(
+        vocab_size=50304, attention=args.attention, dsa_topk=args.dsa_topk,
+    )).to(device)
+    model = raw_model
     if os.environ.get("TORCH_COMPILE_DISABLE") != "1":
         model = torch.compile(model)
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
-    raw_model = model.module if ddp else model
 
     max_steps = args.max_steps
     max_lr = args.max_lr

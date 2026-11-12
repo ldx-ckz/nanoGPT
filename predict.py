@@ -1,20 +1,17 @@
 """Autoregressive generation and KV-cache benchmark for a trained checkpoint."""
 import argparse
-import importlib.util
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import statistics
-import sys
 import time
 
 import tiktoken
 import torch
+from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
+
+import GPT as training
 
 ROOT = Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location("prediction_training", ROOT / "GPT-2.py")
-training = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = training
-spec.loader.exec_module(training)
 
 
 def synchronize(device):
@@ -118,16 +115,25 @@ def main():
             parser.error("No checkpoint found; train first or supply --checkpoint")
         checkpoint_path = paths[-1]
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    trained_dataset = checkpoint.get("training_config", {}).get("dataset")
+    training_config = checkpoint.get("training_config", {})
+    data_dir = training_config.get("data_dir")
+    data_name = PureWindowsPath(data_dir).name if data_dir else None
+    trained_dataset = training_config.get("dataset") or next(
+        (name for name, directory in training.DATA_DIRS.items() if directory == data_name),
+        None,
+    )
     if args.dataset and trained_dataset and args.dataset != trained_dataset:
         parser.error("--dataset differs from checkpoint training dataset")
-    dataset = trained_dataset or dataset
+    dataset = trained_dataset or args.dataset or data_name or dataset
     device = torch.device(args.device)
     precision = args.precision or ("bf16" if device.type == "cuda" else "fp32")
     if precision == "bf16" and device.type != "cuda":
         parser.error("Use fp32 for the CPU benchmark")
     model = training.GPT(training.GPTConfig(**checkpoint["config"]))
-    model.load_state_dict(checkpoint["model"])
+    state_dict = checkpoint["model"]
+    if state_dict and all(key.startswith("_orig_mod.") for key in state_dict):
+        consume_prefix_in_state_dict_if_present(state_dict, "_orig_mod.")
+    model.load_state_dict(state_dict)
     model.to(device).eval()
     encoder = tiktoken.get_encoding("gpt2")
     ids = encoder.encode_ordinary(args.prompt)
