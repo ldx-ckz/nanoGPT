@@ -58,6 +58,41 @@ class RoPE(nn.Module):
         ).flatten(-2)
         return rot.to(dtype=x.dtype)
 
+class DSAIndexer(nn.Module):
+    def __init__(self,config):
+        super().__init__()
+        self.n_head = config.dsa_index_heads
+        self.head_dim = config.dsa_index_dim
+        self.rope_dim = config.mla_rope_dim
+        assert self.rope_dim % 2 == 0
+        self.q_proj = nn.Linear(config.n_embed,self.n_head*self.head_dim,bias=False)
+        self.k_proj = nn.Linear(config.n_embed,self.head_dim,bias=False)
+        self.k_norm = nn.LayerNorm(self.head_dim)
+        self.weight_proj = nn.Linear(config.n_embed,self.n_head,bias=False)
+        self.rope = RoPE(config,head_dim=self.rope_dim)
+    def forward(self,x,past_key = None,offset=0):
+        x = x.detach()
+        B,T,_ = x.size()
+        q = self.q_proj(x).view(B,T,self.n_head,self.head_dim).transpose(1,2)
+        k = self.k_norm(self.k_proj(x)).unsqueeze(1)
+        q = torch.cat((
+            self.rope(q[...,:self.rope_dim],offset=offset),
+            q[...,self.rope_dim:]
+        ),dim=-1)
+        k = torch.cat((
+            self.rope(k[...,:self.rope_dim],offset=offset),
+            k[...,self.rope_dim:]
+        ),dim=-1)
+        if past_key is not None:
+            k = torch.cat((past_key,k),dim=-2)
+        weights = self.weight_proj(x).transpose(1,2).unsqueeze(-1)
+        with torch.autocast(device_type=x.device.type,enabled=False):
+            similarity = q.float()@k.float().transpose(-2,-1)
+            similarity = F.relu(similarity*self.head_dim**-0.5)
+            scores = (similarity*weights.float()*self.n_head**-0.5).sum(dim=1)
+        return scores,k
+
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -66,7 +101,12 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embed = config.n_embed
         self.head_dim = config.n_embed//config.n_head
-        self.use_mla = config.attention == "mla"
+        self.use_mla = config.attention in ("mla","dsa")
+        self.use_dsa = config.attention == "dsa"
+        if self.use_dsa:
+            assert config.dsa_topk>0
+            self.topk = config.dsa_topk
+            self.indexer = DSAIndexer(config)
         if self.use_mla:
             self.kv_rank = config.mla_kv_rank
             self.rope_dim = config.mla_rope_dim
@@ -110,7 +150,62 @@ class CausalSelfAttention(nn.Module):
         k = torch.cat((k_cont, k_rope.expand(-1, self.n_head, -1, -1)), dim=-1)
         return q, k, v, new_cache
 
-    def forward(self, x, past_kv=None, use_cache=False):
+    def _dsa_attention(self,x,past_kv,use_cache,dsa_sparse,return_aux_loss):
+        B,T,C = x.size()
+        past_len = 0 if past_kv is None else past_kv[0].size(-2)
+        mla_past = None if past_kv is None else past_kv[:2]
+        index_past = None if past_kv is None else past_kv[2]
+        q,k,v,mla_cache = self._mla_qkv(x,mla_past,past_len,use_cache)
+        scores,index_k = self.indexer(x,past_key=index_past,offset=past_len)
+        S = k.size(-2)
+        q_pos = past_len+torch.arange(T,device=x.device)
+        k_pos = torch.arange(S,device=x.device)
+        causal = k_pos[None,:]<=q_pos[:,None]
+        allowed = causal.unsqueeze(0).expand(B,-1,-1)
+        if dsa_sparse:
+            r_scores = scores.detach().masked_fill(~allowed,-torch.inf)
+            indices = r_scores.argsort(
+                dim=-1,descending=True,stable=True
+            )[...,:min(self.topk,S)]
+            selected = torch.zeros_like(allowed)
+            selected.scatter_(-1,indices,True)
+            allowed = selected&allowed
+        aux_loss = x.new_zeros((),dtype=torch.float32)
+        if return_aux_loss:
+            with torch.autocast(device_type=x.device.type,enabled=False):
+                with torch.no_grad():
+                    teacher = torch.zeros_like(scores,dtype=torch.float32)
+                    for head in range(self.n_head):
+                        attention_scores = (q[:,head].float()@\
+                                            k[:,head].float().transpose(-2,-1))*\
+                                            self.head_dim**-0.5
+                        attention_scores = attention_scores.masked_fill(
+                            ~allowed,-torch.inf
+                        )
+                        teacher += attention_scores.softmax(dim=-1)
+                    teacher /= self.n_head
+                index_log_probs = scores.float().masked_fill(
+                        ~allowed,-torch.inf
+                    ).log_softmax(dim=-1)
+                index_log_probs = index_log_probs.masked_fill(~allowed, 0.0)
+                aux_loss = F.kl_div(
+                    index_log_probs,teacher,reduction="sum"
+                )/(B*T)
+        y = F.scaled_dot_product_attention(
+            q,k,v,attn_mask=allowed.unsqueeze(1),
+            is_causal=False
+        )
+        y = y.transpose(1,2).contiguous().view(B,T,C)
+        y = self.c_proj(y)
+        new_cache = None
+        if use_cache:
+            new_cache = (*mla_cache,index_k)
+        return y,new_cache,aux_loss
+
+    def forward(self, x, past_kv=None, use_cache=False,dsa_sparse=True,return_aux_loss=False):
+        if self.use_dsa:
+            return self._dsa_attention(
+            x, past_kv, use_cache, dsa_sparse, return_aux_loss)   
         B, T, C = x.size()
         past_len = 0 if past_kv is None else past_kv[0].size(-2)
         if self.use_mla:
@@ -140,7 +235,7 @@ class CausalSelfAttention(nn.Module):
                 q, k, v, attn_mask=mask, is_causal=False)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
-        return y, new_cache
+        return y, new_cache,x.new_zeros((),dtype=torch.float32)
 
 
 class SwiGLU(nn.Module):
@@ -191,12 +286,13 @@ class Block(nn.Module):
         self.ln_2 = RMSNorm(config.n_embed)
         self.mlp = MLP(config)
 
-    def forward(self, x, past_kv=None, use_cache=False):
-        attn_out, new_cache = self.attn(
-            self.ln_1(x), past_kv=past_kv, use_cache=use_cache)
+    def forward(self, x, past_kv=None, use_cache=False,dsa_sparse=True,return_aux_loss=False):
+        attn_out, new_cache,aux_loss= self.attn(
+            self.ln_1(x), past_kv=past_kv, use_cache=use_cache,
+            dsa_sparse=dsa_sparse,return_aux_loss=return_aux_loss)
         x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x, new_cache
+        return x, new_cache,aux_loss
 
 
 @dataclass
@@ -209,6 +305,9 @@ class GPTConfig:
     attention: str = "mha"
     mla_kv_rank: int = 192
     mla_rope_dim: int = 16
+    dsa_index_heads: int = 2
+    dsa_index_dim: int = 32
+    dsa_topk: int = 128
 
 
 class GPT(nn.Module):
@@ -235,7 +334,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, past_kv=None, use_cache=False):
+    def forward(self, idx, targets=None, past_kv=None, use_cache=False,dsa_sparse=True, return_aux_loss=False):
         B, T = idx.size()
         n_layers = len(self.transformer.h)
         if past_kv is None:
@@ -254,9 +353,11 @@ class GPT(nn.Module):
                                                       f"block size is only {self.config.block_size}")
         x = self.transformer.wte(idx)
         new_past_kv = [] if use_cache else None
+        aux_loss = x.new_zeros((), dtype=torch.float32)
         for layer_idx, block in enumerate(self.transformer.h):
-            x, layer_cache = block(
-                x, past_kv=past_kv[layer_idx], use_cache=use_cache)
+            x, layer_cache,layer_aux = block(
+                x, past_kv=past_kv[layer_idx], use_cache=use_cache,dsa_sparse=dsa_sparse,return_aux_loss=return_aux_loss,)
+            aux_loss += layer_aux
             if use_cache:
                 new_past_kv.append(layer_cache)
         x = self.transformer.ln_f(x)
@@ -265,6 +366,8 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1))
+        if return_aux_loss:
+            return logits, loss, new_past_kv, aux_loss / n_layers
         return logits, loss, new_past_kv
 
     def configure_optimizers(self, weight_decay, learning_rate, device):
@@ -380,7 +483,10 @@ def parse_args():
     parser.add_argument("--output-dir", default="runs/wikitext103",
                         help="Run directory; logs and checkpoints are stored inside")
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--attention", choices=("mha", "mla"), default="mha")
+    parser.add_argument("--attention", choices=("mha", "mla","dsa"), default="mha")
+    parser.add_argument("--dsa-warmup-steps", type=int, default=200)
+    parser.add_argument("--dsa-loss-weight", type=float, default=1.0)
+    parser.add_argument("--dsa-topk", type=int, default=128)
     args = parser.parse_args()
     if args.total_batch_size <= 0 or (args.train_tokens is not None and args.train_tokens <= 0):
         parser.error("Global batch size and token budget must be positive")
@@ -397,6 +503,8 @@ def parse_args():
             "Require 1 <= seq-len <= 1024 and 0 <= warmup-steps < max-steps")
     if args.max_lr <= 0 or (args.train_tokens is not None and args.train_tokens <= 0):
         parser.error("Learning rate and token budget must be positive")
+    if args.dsa_warmup_steps < 0 or args.dsa_loss_weight <= 0 or args.dsa_topk <= 0:
+        parser.error("Require nonnegative DSA warmup and positive loss weight/topk")
     return args
 
 
@@ -454,7 +562,7 @@ def main():
 
     torch.set_float32_matmul_precision('high')
 
-    model = GPT(GPTConfig(vocab_size=50304, attention=args.attention))
+    model = GPT(GPTConfig(vocab_size=50304, attention=args.attention,dsa_topk=args.dsa_topk,))
     model.to(device)
     if os.environ.get("TORCH_COMPILE_DISABLE") != "1":
         model = torch.compile(model)
@@ -499,6 +607,7 @@ def main():
     for step in range(max_steps):
         t0 = time.time()
         last_step = (step == max_steps-1)
+        dsa_sparse = step >= args.dsa_warmup_steps
         if step % args.eval_interval == 0 or last_step:
             model.eval()
             val_loader.reset()
@@ -510,7 +619,7 @@ def main():
                     x, y = val_loader.next_batch()
                     x, y = x.to(device), y.to(device)
                     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, loss, _ = model(x, y)
+                        logits, loss, _ = model(x, y,dsa_sparse=dsa_sparse)
                     loss = loss/val_loss_steps
                     val_loss_accum += loss.detach()
             if ddp:
@@ -523,6 +632,7 @@ def main():
         model.train()
         optimizer.zero_grad()
         loss_accum = 0.0
+        index_loss_accum = torch.zeros((),device=device)
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch()
             x, y = x.to(device), y.to(device)
@@ -530,12 +640,14 @@ def main():
                 model.require_backward_grad_sync = (
                     micro_step == grad_accum_steps-1)
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits, loss, _ = model(x, y)
-            loss = loss/grad_accum_steps
-            loss_accum += loss.detach()
-            loss.backward()
+                logits, ce_loss, _ ,index_loss= model(x, y,dsa_sparse=dsa_sparse,return_aux_loss=True)
+                total_loss = ce_loss+args.dsa_loss_weight*index_loss
+            loss_accum += ce_loss.detach()/grad_accum_steps
+            index_loss_accum += index_loss.detach()/grad_accum_steps
+            (total_loss / grad_accum_steps).backward()
         if ddp:
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+            dist.all_reduce(index_loss_accum, op=dist.ReduceOp.AVG)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
@@ -549,9 +661,10 @@ def main():
             train_loader.T * grad_accum_steps * ddp_world_size
         tokens_per_sec = tokens_processed / dt
         if master_process:
-            print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+            print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | index_kl: {index_loss_accum.item():.6f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} train {loss_accum.item():.6f}\n")
+                f.write(f"{step} index_kl {index_loss_accum.item():.6f}\n")
             if (step + 1) % args.checkpoint_interval == 0 or last_step:
                 checkpoints_path = checkpoints_dir / f"model_{step + 1:05d}.pt"
                 checkpoint = {
