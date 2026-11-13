@@ -1,3 +1,6 @@
+import tinystories
+import predict
+import GPT as training
 import contextlib
 from dataclasses import asdict
 import io
@@ -14,10 +17,6 @@ import numpy as np
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
-import GPT as training
-import predict
-import tinystories
-
 
 class KVCacheTests(unittest.TestCase):
     def make_model(self, attention):
@@ -28,8 +27,9 @@ class KVCacheTests(unittest.TestCase):
         )).eval()
 
     def test_prefill_single_token_and_chunk_decode_match_full_forward(self):
-        tokens = torch.randint(128, (3, 16), generator=torch.Generator().manual_seed(1337))
-        for attention in ("mha", "mla"):
+        tokens = torch.randint(
+            128, (3, 16), generator=torch.Generator().manual_seed(1337))
+        for attention in ("mha", "mla", "gpt2"):
             with self.subTest(attention=attention), torch.inference_mode():
                 model = self.make_model(attention)
                 full, _, empty = model(tokens, use_cache=False)
@@ -48,7 +48,8 @@ class KVCacheTests(unittest.TestCase):
                         else:
                             expected = ((3, 2, offset, 16),) * 2
                         for layer_cache in cache:
-                            self.assertEqual(tuple(t.shape for t in layer_cache), expected)
+                            self.assertEqual(
+                                tuple(t.shape for t in layer_cache), expected)
                         parts.append(out)
                     torch.testing.assert_close(
                         torch.cat(parts, 1), full, atol=1e-6, rtol=1e-5)
@@ -62,7 +63,8 @@ class KVCacheTests(unittest.TestCase):
         for attention, elements_per_token in (("mha", 2 * 2 * 16), ("mla", 8 + 4)):
             with self.subTest(attention=attention):
                 model = self.make_model(attention)
-                result = predict.benchmark(model, prompt, new_tokens=6, repeats=1, warmup=0)
+                result = predict.benchmark(
+                    model, prompt, new_tokens=6, repeats=1, warmup=0)
                 self.assertTrue(result["output_tokens_equal"])
                 self.assertEqual(len(result["runs"]), 2)
 
@@ -70,9 +72,12 @@ class KVCacheTests(unittest.TestCase):
                 self.assertFalse(no_cache["use_cache"])
                 self.assertTrue(cached["use_cache"])
                 self.assertEqual(len(cached["token_ids"]), 9)
-                self.assertEqual([step["forward_tokens"] for step in no_cache["steps"]], list(range(3, 9)))
-                self.assertEqual([step["forward_tokens"] for step in cached["steps"]], [3, 1, 1, 1, 1, 1])
-                self.assertEqual([step["cached_tokens"] for step in cached["steps"]], list(range(3, 9)))
+                self.assertEqual([step["forward_tokens"]
+                                 for step in no_cache["steps"]], list(range(3, 9)))
+                self.assertEqual([step["forward_tokens"]
+                                 for step in cached["steps"]], [3, 1, 1, 1, 1, 1])
+                self.assertEqual([step["cached_tokens"]
+                                 for step in cached["steps"]], list(range(3, 9)))
                 self.assertEqual(no_cache["logical_cache_bytes"], 0)
                 self.assertEqual(cached["logical_cache_bytes"],
                                  8 * model.config.n_layers * elements_per_token *
@@ -93,11 +98,13 @@ class KVCacheTests(unittest.TestCase):
                 argv = [
                     "predict.py", "--checkpoint", str(checkpoint_path),
                     "--prompt", "!", "--max-new-tokens", "2", "--device", "cpu",
-                    "--repeats", "1", "--warmup", "0", "--output-dir", str(output),
+                    "--repeats", "1", "--warmup", "0", "--output-dir", str(
+                        output),
                 ]
                 with patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
                     predict.main()
-                summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+                summary = json.loads(
+                    (output / "summary.json").read_text(encoding="utf-8"))
                 self.assertEqual(summary["dataset"], "tinystory")
                 self.assertTrue(summary["output_tokens_equal"])
 

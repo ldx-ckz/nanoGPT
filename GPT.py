@@ -62,40 +62,43 @@ class RoPE(nn.Module):
         ).flatten(-2)
         return rot.to(dtype=x.dtype)
 
+
 class DSAIndexer(nn.Module):
-    def __init__(self,config):
+    def __init__(self, config):
         super().__init__()
         self.n_head = config.dsa_index_heads
         self.head_dim = config.dsa_index_dim
         self.rope_dim = config.mla_rope_dim
         assert self.rope_dim % 2 == 0
-        self.q_proj = nn.Linear(config.n_embed,self.n_head*self.head_dim,bias=False)
-        self.k_proj = nn.Linear(config.n_embed,self.head_dim,bias=False)
+        self.q_proj = nn.Linear(
+            config.n_embed, self.n_head*self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.n_embed, self.head_dim, bias=False)
         self.k_norm = nn.LayerNorm(self.head_dim)
-        self.weight_proj = nn.Linear(config.n_embed,self.n_head,bias=False)
-        self.rope = RoPE(config,head_dim=self.rope_dim)
-    def forward(self,x,past_key = None,offset=0):
+        self.weight_proj = nn.Linear(config.n_embed, self.n_head, bias=False)
+        self.rope = RoPE(config, head_dim=self.rope_dim)
+
+    def forward(self, x, past_key=None, offset=0):
         x = x.detach()
-        B,T,_ = x.size()
-        q = self.q_proj(x).view(B,T,self.n_head,self.head_dim).transpose(1,2)
+        B, T, _ = x.size()
+        q = self.q_proj(x).view(B, T, self.n_head,
+                                self.head_dim).transpose(1, 2)
         k = self.k_norm(self.k_proj(x)).unsqueeze(1)
         q = torch.cat((
-            self.rope(q[...,:self.rope_dim],offset=offset),
-            q[...,self.rope_dim:]
-        ),dim=-1)
+            self.rope(q[..., :self.rope_dim], offset=offset),
+            q[..., self.rope_dim:]
+        ), dim=-1)
         k = torch.cat((
-            self.rope(k[...,:self.rope_dim],offset=offset),
-            k[...,self.rope_dim:]
-        ),dim=-1)
+            self.rope(k[..., :self.rope_dim], offset=offset),
+            k[..., self.rope_dim:]
+        ), dim=-1)
         if past_key is not None:
-            k = torch.cat((past_key,k),dim=-2)
-        weights = self.weight_proj(x).transpose(1,2).unsqueeze(-1)
-        with torch.autocast(device_type=x.device.type,enabled=False):
-            similarity = q.float()@k.float().transpose(-2,-1)
+            k = torch.cat((past_key, k), dim=-2)
+        weights = self.weight_proj(x).transpose(1, 2).unsqueeze(-1)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            similarity = q.float()@k.float().transpose(-2, -1)
             similarity = F.relu(similarity*self.head_dim**-0.5)
             scores = (similarity*weights.float()*self.n_head**-0.5).sum(dim=1)
-        return scores,k
-
+        return scores, k
 
 
 class CausalSelfAttention(nn.Module):
@@ -105,10 +108,11 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embed = config.n_embed
         self.head_dim = config.n_embed//config.n_head
-        self.use_mla = config.attention in ("mla","dsa")
+        self.use_mla = config.attention in ("mla", "dsa")
         self.use_dsa = config.attention == "dsa"
+        self.use_gpt2 = config.attention == "gpt2"
         if self.use_dsa:
-            assert config.dsa_topk>0
+            assert config.dsa_topk > 0
             self.topk = config.dsa_topk
             self.indexer = DSAIndexer(config)
         if self.use_mla:
@@ -126,10 +130,11 @@ class CausalSelfAttention(nn.Module):
                 self.cont_dim+self.head_dim), bias=False)
         else:
             self.c_attn = nn.Linear(
-                config.n_embed, config.n_embed*3, bias=False)
-        self.c_proj = nn.Linear(config.n_embed, config.n_embed, bias=False)
+                config.n_embed, config.n_embed*3, bias=self.use_gpt2)
+        self.c_proj = nn.Linear(
+            config.n_embed, config.n_embed, bias=self.use_gpt2)
         self.c_proj.GPT2_SCALE_INIT = 1
-        self.rope = RoPE(
+        self.rope = None if self.use_gpt2 else RoPE(
             config, head_dim=self.rope_dim if self.use_mla else None)
 
     def _mla_qkv(self, x, past_kv, past_len, use_cache):
@@ -154,62 +159,62 @@ class CausalSelfAttention(nn.Module):
         k = torch.cat((k_cont, k_rope.expand(-1, self.n_head, -1, -1)), dim=-1)
         return q, k, v, new_cache
 
-    def _dsa_attention(self,x,past_kv,use_cache,dsa_sparse,return_aux_loss):
-        B,T,C = x.size()
+    def _dsa_attention(self, x, past_kv, use_cache, dsa_sparse, return_aux_loss):
+        B, T, C = x.size()
         past_len = 0 if past_kv is None else past_kv[0].size(-2)
         mla_past = None if past_kv is None else past_kv[:2]
         index_past = None if past_kv is None else past_kv[2]
-        q,k,v,mla_cache = self._mla_qkv(x,mla_past,past_len,use_cache)
-        scores,index_k = self.indexer(x,past_key=index_past,offset=past_len)
+        q, k, v, mla_cache = self._mla_qkv(x, mla_past, past_len, use_cache)
+        scores, index_k = self.indexer(x, past_key=index_past, offset=past_len)
         S = k.size(-2)
-        q_pos = past_len+torch.arange(T,device=x.device)
-        k_pos = torch.arange(S,device=x.device)
-        causal = k_pos[None,:]<=q_pos[:,None]
-        allowed = causal.unsqueeze(0).expand(B,-1,-1)
+        q_pos = past_len+torch.arange(T, device=x.device)
+        k_pos = torch.arange(S, device=x.device)
+        causal = k_pos[None, :] <= q_pos[:, None]
+        allowed = causal.unsqueeze(0).expand(B, -1, -1)
         if dsa_sparse:
-            r_scores = scores.detach().masked_fill(~allowed,-torch.inf)
+            r_scores = scores.detach().masked_fill(~allowed, -torch.inf)
             indices = r_scores.argsort(
-                dim=-1,descending=True,stable=True
-            )[...,:min(self.topk,S)]
+                dim=-1, descending=True, stable=True
+            )[..., :min(self.topk, S)]
             selected = torch.zeros_like(allowed)
-            selected.scatter_(-1,indices,True)
-            allowed = selected&allowed
-        aux_loss = x.new_zeros((),dtype=torch.float32)
+            selected.scatter_(-1, indices, True)
+            allowed = selected & allowed
+        aux_loss = x.new_zeros((), dtype=torch.float32)
         if return_aux_loss:
-            with torch.autocast(device_type=x.device.type,enabled=False):
+            with torch.autocast(device_type=x.device.type, enabled=False):
                 with torch.no_grad():
-                    teacher = torch.zeros_like(scores,dtype=torch.float32)
+                    teacher = torch.zeros_like(scores, dtype=torch.float32)
                     for head in range(self.n_head):
-                        attention_scores = (q[:,head].float()@\
-                                            k[:,head].float().transpose(-2,-1))*\
-                                            self.head_dim**-0.5
+                        attention_scores = (q[:, head].float() @
+                                            k[:, head].float().transpose(-2, -1)) *\
+                            self.head_dim**-0.5
                         attention_scores = attention_scores.masked_fill(
-                            ~allowed,-torch.inf
+                            ~allowed, -torch.inf
                         )
                         teacher += attention_scores.softmax(dim=-1)
                     teacher /= self.n_head
                 index_log_probs = scores.float().masked_fill(
-                        ~allowed,-torch.inf
-                    ).log_softmax(dim=-1)
+                    ~allowed, -torch.inf
+                ).log_softmax(dim=-1)
                 index_log_probs = index_log_probs.masked_fill(~allowed, 0.0)
                 aux_loss = F.kl_div(
-                    index_log_probs,teacher,reduction="sum"
+                    index_log_probs, teacher, reduction="sum"
                 )/(B*T)
         y = F.scaled_dot_product_attention(
-            q,k,v,attn_mask=allowed.unsqueeze(1),
+            q, k, v, attn_mask=allowed.unsqueeze(1),
             is_causal=False
         )
-        y = y.transpose(1,2).contiguous().view(B,T,C)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         new_cache = None
         if use_cache:
-            new_cache = (*mla_cache,index_k)
-        return y,new_cache,aux_loss
+            new_cache = (*mla_cache, index_k)
+        return y, new_cache, aux_loss
 
-    def forward(self, x, past_kv=None, use_cache=False,dsa_sparse=True,return_aux_loss=False):
+    def forward(self, x, past_kv=None, use_cache=False, dsa_sparse=True, return_aux_loss=False):
         if self.use_dsa:
             return self._dsa_attention(
-            x, past_kv, use_cache, dsa_sparse, return_aux_loss)   
+                x, past_kv, use_cache, dsa_sparse, return_aux_loss)
         B, T, C = x.size()
         past_len = 0 if past_kv is None else past_kv[0].size(-2)
         if self.use_mla:
@@ -220,8 +225,9 @@ class CausalSelfAttention(nn.Module):
             q = q.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
             k = k.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
             v = v.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
-            q = self.rope(q, offset=past_len)
-            k = self.rope(k, offset=past_len)
+            if self.rope is not None:
+                q = self.rope(q, offset=past_len)
+                k = self.rope(k, offset=past_len)
             if past_kv is not None:
                 past_k, past_v = past_kv
                 k = torch.cat((past_k, k), dim=-2)
@@ -239,7 +245,7 @@ class CausalSelfAttention(nn.Module):
                 q, k, v, attn_mask=mask, is_causal=False)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
-        return y, new_cache,x.new_zeros((),dtype=torch.float32)
+        return y, new_cache, x.new_zeros((), dtype=torch.float32)
 
 
 class SwiGLU(nn.Module):
@@ -270,6 +276,19 @@ class MLP(nn.Module):
         return self.swg(x)
 
 
+class GPT2MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        dim = config.n_embed
+        self.c_fc = nn.Linear(dim, dim*4)
+        self.gelu = nn.GELU(approximate="tanh")
+        self.c_proj = nn.Linear(4*dim, dim)
+        self.c_proj.GPT2_SCALE_INIT = 1
+
+    def forward(self, x):
+        return self.c_proj(self.gelu(self.c_fc(x)))
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
@@ -285,18 +304,20 @@ class RMSNorm(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = RMSNorm(config.n_embed)
+        use_gpt2 = config.attention == "gpt2"
+        norm = nn.LayerNorm if use_gpt2 else RMSNorm
+        self.ln_1 = norm(config.n_embed)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = RMSNorm(config.n_embed)
-        self.mlp = MLP(config)
+        self.ln_2 = norm(config.n_embed)
+        self.mlp = GPT2MLP(config) if use_gpt2 else MLP(config)
 
-    def forward(self, x, past_kv=None, use_cache=False,dsa_sparse=True,return_aux_loss=False):
-        attn_out, new_cache,aux_loss= self.attn(
+    def forward(self, x, past_kv=None, use_cache=False, dsa_sparse=True, return_aux_loss=False):
+        attn_out, new_cache, aux_loss = self.attn(
             self.ln_1(x), past_kv=past_kv, use_cache=use_cache,
-            dsa_sparse=dsa_sparse,return_aux_loss=return_aux_loss)
+            dsa_sparse=dsa_sparse, return_aux_loss=return_aux_loss)
         x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x, new_cache,aux_loss
+        return x, new_cache, aux_loss
 
 
 @dataclass
@@ -318,11 +339,18 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.transformer = nn.ModuleDict(dict(
-            wte=nn.Embedding(config.vocab_size, config.n_embed),
-            h=nn.ModuleList([Block(config) for _ in range(config.n_layers)]),
-            ln_f=RMSNorm(config.n_embed),
-        ))
+        self.use_gpt2 = config.attention == "gpt2"
+        norm = nn.LayerNorm if self.use_gpt2 else RMSNorm
+        self.transformer = nn.ModuleDict()
+        self.transformer["wte"] = nn.Embedding(
+            config.vocab_size, config.n_embed)
+        if self.use_gpt2:
+            self.transformer["wpe"] = nn.Embedding(
+                config.block_size, config.n_embed)
+        self.transformer["h"] = nn.ModuleList([
+            Block(config) for _ in range(config.n_layers)
+        ])
+        self.transformer["ln_f"] = norm(config.n_embed)
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
         self.apply(self._init_weights)
@@ -338,7 +366,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, past_kv=None, use_cache=False,dsa_sparse=True, return_aux_loss=False):
+    def forward(self, idx, targets=None, past_kv=None, use_cache=False, dsa_sparse=True, return_aux_loss=False):
         B, T = idx.size()
         n_layers = len(self.transformer.h)
         if past_kv is None:
@@ -356,11 +384,14 @@ class GPT(nn.Module):
         assert past_len+T <= self.config.block_size, (f"Cannot forward sequence of length {past_len+T}, "
                                                       f"block size is only {self.config.block_size}")
         x = self.transformer.wte(idx)
+        if self.use_gpt2:
+            pos = torch.arange(past_len, past_len+T, device=idx.device)
+            x += self.transformer.wpe(pos)
         new_past_kv = [] if use_cache else None
         aux_loss = x.new_zeros((), dtype=torch.float32)
         for layer_idx, block in enumerate(self.transformer.h):
-            x, layer_cache,layer_aux = block(
-                x, past_kv=past_kv[layer_idx], use_cache=use_cache,dsa_sparse=dsa_sparse,return_aux_loss=return_aux_loss,)
+            x, layer_cache, layer_aux = block(
+                x, past_kv=past_kv[layer_idx], use_cache=use_cache, dsa_sparse=dsa_sparse, return_aux_loss=return_aux_loss,)
             aux_loss += layer_aux
             if use_cache:
                 new_past_kv.append(layer_cache)
@@ -487,7 +518,8 @@ def parse_args():
     parser.add_argument("--output-dir", default="runs/wikitext103",
                         help="Run directory; logs and checkpoints are stored inside")
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--attention", choices=("mha", "mla","dsa"), default="mha")
+    parser.add_argument("--attention", choices=("gpt2",
+                        "mha", "mla", "dsa"), default="mha")
     parser.add_argument("--dsa-warmup-steps", type=int, default=200)
     parser.add_argument("--dsa-loss-weight", type=float, default=1.0)
     parser.add_argument("--dsa-topk", type=int, default=128)
@@ -508,7 +540,8 @@ def parse_args():
     if args.max_lr <= 0 or (args.train_tokens is not None and args.train_tokens <= 0):
         parser.error("Learning rate and token budget must be positive")
     if args.dsa_warmup_steps < 0 or args.dsa_loss_weight <= 0 or args.dsa_topk <= 0:
-        parser.error("Require nonnegative DSA warmup and positive loss weight/topk")
+        parser.error(
+            "Require nonnegative DSA warmup and positive loss weight/topk")
     return args
 
 
@@ -624,7 +657,7 @@ def main():
                     x, y = val_loader.next_batch()
                     x, y = x.to(device), y.to(device)
                     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, loss, _ = model(x, y,dsa_sparse=dsa_sparse)
+                        logits, loss, _ = model(x, y, dsa_sparse=dsa_sparse)
                     loss = loss/val_loss_steps
                     val_loss_accum += loss.detach()
             if ddp:
@@ -637,7 +670,7 @@ def main():
         model.train()
         optimizer.zero_grad()
         loss_accum = 0.0
-        index_loss_accum = torch.zeros((),device=device)
+        index_loss_accum = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch()
             x, y = x.to(device), y.to(device)
@@ -645,7 +678,8 @@ def main():
                 model.require_backward_grad_sync = (
                     micro_step == grad_accum_steps-1)
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits, ce_loss, _ ,index_loss= model(x, y,dsa_sparse=dsa_sparse,return_aux_loss=True)
+                logits, ce_loss, _, index_loss = model(
+                    x, y, dsa_sparse=dsa_sparse, return_aux_loss=True)
                 total_loss = ce_loss+args.dsa_loss_weight*index_loss
             loss_accum += ce_loss.detach()/grad_accum_steps
             index_loss_accum += index_loss.detach()/grad_accum_steps
