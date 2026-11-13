@@ -114,8 +114,7 @@ D's 153 dense warmup updates count toward the same training budget.
 Use the same prepared WikiText-103 shards and GPT-2 BPE across all groups.
 The launcher records the dataset revision and manifest hash in each run's
 `experiment.json`. Training uses the train split and monitors the validation
-split. Reserve the test split for final checkpoint evaluation with the shared
-evaluator once it is available.
+split. Reserve the test split for final checkpoint evaluation.
 
 The starting configuration is two GPUs, four sequences per GPU, sequence length
 1024 and two accumulation steps per optimizer update. This gives 16,384 tokens
@@ -140,3 +139,51 @@ CUDA_VISIBLE_DEVICES=0,1 pwsh -NoProfile -File scripts/ablation.ps1 -Group A -Ru
 
 Repeat for B, C and D. Each group writes to its own directory under
 `runs/ablation/wikitext-seed1337/`.
+
+### Final checkpoint evaluation
+
+Run the same evaluation for all four groups on one GPU. Start with
+`split=val`. After fixing the checkpoint selection and evaluation settings,
+set `split=test` and run the loop again. The default ablation budget
+produces `model_03052.pt`.
+
+```bash
+split=val
+for group in A-gpt2 B-mha C-mla D-dsa; do
+  run="runs/ablation/wikitext-seed1337/$group"
+  python evaluate.py \
+    --checkpoint "$run/checkpoints/model_03052.pt" \
+    --data-dir wikitext103 --split "$split" --seq-len 1024 \
+    --device cuda --precision fp32 --output "$run/eval_$split.json" || break
+done
+```
+
+The evaluator follows the shard order in `manifest.json` and scores all
+next-token targets in non-overlapping input windows, including the final short
+window. Context resets at each window. The mean cross-entropy is weighted by
+the number of tokens and perplexity is its exponential. This is GPT-2 BPE
+token-level perplexity over the model's full output vocabulary. D uses sparse
+attention. With the current shards, the expected target counts are 247,475
+for validation and 283,487 for test. Compare manifest hashes, evaluated token
+counts, sequence lengths and precision across reports before comparing scores.
+
+### Inference benchmark
+
+Run the same prompt on the same GPU for each checkpoint. This prompt is long
+enough to exercise D's top-k selection during prefill.
+
+```bash
+prompt="$(cat scripts/wikitext_benchmark_prompt.txt)"
+for group in A-gpt2 B-mha C-mla D-dsa; do
+  run="runs/ablation/wikitext-seed1337/$group"
+  python predict.py \
+    --dataset wikitext --checkpoint "$run/checkpoints/model_03052.pt" \
+    --prompt "$prompt" --max-new-tokens 128 --device cuda --precision bf16 \
+    --repeats 3 --warmup 1 --output-dir "$run/prediction_bench" || break
+done
+```
+
+Compare the medians in `prediction_bench/summary.json` for time to first
+token, decode latency, throughput, logical cache bytes and peak CUDA memory.
+`output_tokens_equal` compares greedy outputs with and without caching
+within each model.

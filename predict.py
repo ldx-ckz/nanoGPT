@@ -14,6 +14,17 @@ import GPT as training
 ROOT = Path(__file__).resolve().parent
 
 
+def load_checkpoint_model(checkpoint, device):
+    model = training.GPT(training.GPTConfig(**checkpoint["config"]))
+    state_dict = checkpoint["model"]
+
+    if state_dict and all(key.startswith("_orig_mod.") for key in state_dict):
+        consume_prefix_in_state_dict_if_present(state_dict, "_orig_mod.")
+
+    model.load_state_dict(state_dict, strict=True)
+    return model.to(device).eval()
+
+
 def synchronize(device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -36,14 +47,16 @@ def generate(model, prompt, new_tokens, use_cache, precision="fp32"):
     synchronize(device)
     started = time.perf_counter()
     for step in range(new_tokens):
-        inputs = sequence[:, -1:] if use_cache and cache is not None else sequence
+        inputs = sequence[:, -
+                          1:] if use_cache and cache is not None else sequence
         t0 = time.perf_counter()
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                             enabled=precision == "bf16"):
             logits, _, cache = model(inputs, past_kv=cache if use_cache else None,
                                      use_cache=use_cache)
         # The padded training vocabulary has extra rows without GPT-2 token IDs.
-        next_token = logits[:, -1, :min(50257, model.config.vocab_size)].argmax(-1, keepdim=True)
+        next_token = logits[:, -1,
+                            :min(50257, model.config.vocab_size)].argmax(-1, keepdim=True)
         sequence = torch.cat((sequence, next_token), dim=1)
         synchronize(device)
         elapsed = time.perf_counter() - t0
@@ -53,7 +66,8 @@ def generate(model, prompt, new_tokens, use_cache, precision="fp32"):
                       "cached_tokens": cache[0][0].shape[-2] if cache else 0})
     total = time.perf_counter() - started
     decode_seconds = sum(item["seconds"] for item in steps[1:])
-    cache_bytes = sum(t.numel() * t.element_size() for pair in cache for t in pair) if cache else 0
+    cache_bytes = sum(t.numel() * t.element_size()
+                      for pair in cache for t in pair) if cache else 0
     return {"use_cache": use_cache, "prompt_tokens": prompt.shape[1], "new_tokens": new_tokens,
             "seconds": total, "tokens_per_second": new_tokens / total,
             "ttft_ms": steps[0]["seconds"] * 1000,
@@ -103,23 +117,28 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--precision", choices=("fp32", "bf16"))
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
     dataset = args.dataset or "wikitext"
     checkpoint_path = args.checkpoint
     if checkpoint_path is None:
-        paths = sorted((ROOT / "runs" / training.DATA_DIRS[dataset] / "checkpoints").glob("model_*.pt"))
+        paths = sorted(
+            (ROOT / "runs" / training.DATA_DIRS[dataset] / "checkpoints").glob("model_*.pt"))
         if not paths:
-            parser.error("No checkpoint found; train first or supply --checkpoint")
+            parser.error(
+                "No checkpoint found; train first or supply --checkpoint")
         checkpoint_path = paths[-1]
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=True)
     training_config = checkpoint.get("training_config", {})
     data_dir = training_config.get("data_dir")
     data_name = PureWindowsPath(data_dir).name if data_dir else None
     trained_dataset = training_config.get("dataset") or next(
-        (name for name, directory in training.DATA_DIRS.items() if directory == data_name),
+        (name for name, directory in training.DATA_DIRS.items()
+         if directory == data_name),
         None,
     )
     if args.dataset and trained_dataset and args.dataset != trained_dataset:
@@ -129,33 +148,34 @@ def main():
     precision = args.precision or ("bf16" if device.type == "cuda" else "fp32")
     if precision == "bf16" and device.type != "cuda":
         parser.error("Use fp32 for the CPU benchmark")
-    model = training.GPT(training.GPTConfig(**checkpoint["config"]))
-    state_dict = checkpoint["model"]
-    if state_dict and all(key.startswith("_orig_mod.") for key in state_dict):
-        consume_prefix_in_state_dict_if_present(state_dict, "_orig_mod.")
-    model.load_state_dict(state_dict)
-    model.to(device).eval()
+    model = load_checkpoint_model(checkpoint, device)
     encoder = tiktoken.get_encoding("gpt2")
     ids = encoder.encode_ordinary(args.prompt)
     if not ids or len(ids) + args.max_new_tokens > model.config.block_size:
-        parser.error("Require a nonempty prompt fitting prompt+generation inside block_size")
+        parser.error(
+            "Require a nonempty prompt fitting prompt+generation inside block_size")
     if args.max_new_tokens < 1 or args.repeats < 1 or args.warmup < 0:
-        parser.error("Require positive max-new-tokens/repeats and nonnegative warmup")
+        parser.error(
+            "Require positive max-new-tokens/repeats and nonnegative warmup")
     prompt = torch.tensor([ids], dtype=torch.long, device=device)
-    result = benchmark(model, prompt, args.max_new_tokens, args.repeats, args.warmup, precision)
+    result = benchmark(model, prompt, args.max_new_tokens,
+                       args.repeats, args.warmup, precision)
     result.update(dataset=dataset, checkpoint=str(checkpoint_path.resolve()), prompt=args.prompt,
                   device=str(device), device_name=torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
                   torch_version=str(torch.__version__))
     for run in result["runs"]:
         run["generated_text"] = encoder.decode(run["token_ids"])
-    output = args.output_dir or checkpoint_path.resolve().parent.parent / "prediction"
+    output = args.output_dir or checkpoint_path.resolve().parent.parent / \
+        "prediction"
     output.mkdir(parents=True, exist_ok=True)
-    (output / "summary.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    (output / "summary.json").write_text(json.dumps(result,
+                                                    indent=2, ensure_ascii=False), encoding="utf-8")
     lines = []
     with (output / "steps.jsonl").open("w", encoding="utf-8") as file:
         for run in result["runs"]:
             for step in run["steps"]:
-                row = {"repeat": run["repeat"], "use_cache": run["use_cache"], **step}
+                row = {"repeat": run["repeat"],
+                       "use_cache": run["use_cache"], **step}
                 file.write(json.dumps(row) + "\n")
                 lines.append(f"cache={run['use_cache']} run={run['repeat']} step={step['step']:3d} "
                              f"context={step['context_tokens']:4d} input={step['forward_tokens']:4d} "
@@ -167,7 +187,8 @@ def main():
     lines.append(f"speedup_total={result['speedup_total']:.3f}x; speedup_decode={result['speedup_decode']}; "
                  f"output_tokens_equal={result['output_tokens_equal']}")
     for run in result["runs"][:2]:
-        lines.append(f"\ncache={run['use_cache']} sample:\n{run['generated_text']}")
+        lines.append(
+            f"\ncache={run['use_cache']} sample:\n{run['generated_text']}")
     (output / "prediction_log.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(lines))
     print(f"Saved prediction logs to {output}")
