@@ -94,3 +94,49 @@ Article EOT/newline handling is part of this repository's preprocessing protocol
 
 For TinyStories preparation, dataset selection and autoregressive prediction
 with KV-cache timing/memory logs, see [prediction.md](prediction.md).
+
+## Four-group ablation on WikiText-103
+
+| Group | `--attention` | Architecture |
+| --- | --- | --- |
+| A | `gpt2` | GPT-2 with learned absolute positions, LayerNorm and GELU |
+| B | `mha` | Current RMSNorm, SwiGLU and RoPE backbone with MHA |
+| C | `mla` | Current backbone with MLA |
+| D | `dsa` | Current backbone with MLA and DSA |
+
+A follows this repository's `GPT-2.py` at
+[`9de41b7`](https://github.com/ldx-ckz/nanoGPT-2/commit/9de41b75b4c2562d0b1e06aef8d11bc3312e5dfa),
+the WikiText-103 version before the normalization, FFN and RoPE changes.
+The architecture follows [Karpathy's `6104ab1`](https://github.com/karpathy/build-nanogpt/blob/6104ab1b53920f6e2159749676073ff7d815c1fa/train_gpt2.py).
+Run all four groups through the current `GPT.py` from random initialization.
+D's 153 dense warmup updates count toward the same training budget.
+
+Use the same prepared WikiText-103 shards and GPT-2 BPE across all groups.
+The launcher records the dataset revision and manifest hash in each run's
+`experiment.json`. Training uses the train split and monitors the validation
+split. Reserve the test split for final checkpoint evaluation with the shared
+evaluator once it is available.
+
+The starting configuration is two GPUs, four sequences per GPU, sequence length
+1024 and two accumulation steps per optimizer update. This gives 16,384 tokens
+per update and 3,052 updates (50,003,968 tokens) per group. All groups use seed
+1337, a peak learning rate of `6e-4`, and eager execution. D uses top-k 128 and
+KL weight 1.0. Run a short check on the target GPUs before starting full runs.
+
+From the repo root, preview the commands with PowerShell:
+
+```powershell
+.\scripts\ablation.ps1
+.\scripts\ablation.ps1 -Group D
+```
+
+On the Linux server, activate the project's Python environment and use PowerShell
+7 (`pwsh`). Once the experiment preparation is complete, launch one group at a
+time from the repository root:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 pwsh -NoProfile -File scripts/ablation.ps1 -Group A -Run
+```
+
+Repeat for B, C and D. Each group writes to its own directory under
+`runs/ablation/wikitext-seed1337/`.

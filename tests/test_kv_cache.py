@@ -1,8 +1,6 @@
-import tinystories
-import predict
-import GPT as training
 import contextlib
 from dataclasses import asdict
+from importlib import import_module
 import io
 import json
 from pathlib import Path
@@ -16,6 +14,11 @@ import numpy as np
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
+
+# Load these after adding the repository root for direct script execution.
+training = import_module("GPT")
+predict = import_module("predict")
+tinystories = import_module("tinystories")
 
 
 class KVCacheTests(unittest.TestCase):
