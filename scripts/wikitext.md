@@ -84,8 +84,10 @@ Choose a different `--output-dir` for each experiment: reusing a run directory
 overwrites its config, log and matching checkpoint filenames.
 
 Each run stores `training_config.json`, `log/log.txt` and `checkpoints/*.pt`.
-Checkpoints contain model weights, model config, completed updates and the
-training token count. They do not implement complete training-state resume.
+New checkpoints include model and AdamW state, completed updates, the training
+data position, the dataset manifest hash and each rank's RNG state. Resume
+with the same model, training schedule and number of processes. The dataset
+directory can move if its manifest is identical. Keep all shard files intact.
 
 Only train and val are read during training. The held-out test shards are for
 final evaluation. The logged validation loss is a fixed-batch training monitor,
@@ -139,6 +141,19 @@ CUDA_VISIBLE_DEVICES=0,1 pwsh -NoProfile -File scripts/ablation.ps1 -Group A -Ru
 
 Repeat for B, C and D. Each group writes to its own directory under
 `runs/ablation/wikitext-seed1337/`.
+
+To resume an interrupted A run, pass its latest completed checkpoint to the
+same launcher. Replace the example step with the one you want to resume from.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 pwsh -NoProfile -File scripts/ablation.ps1 -Group A \
+  -Resume runs/ablation/wikitext-seed1337/A-gpt2/checkpoints/model_00500.pt -Run
+```
+
+Omit `-Run` to preview. Logs are retained through the restored update, and
+later entries are replayed. A single-process checkpoint with the older
+top-level RNG fields can still resume on one process. Dual-GPU resume
+requires a checkpoint containing both ranks' RNG states.
 
 ### Final checkpoint evaluation
 

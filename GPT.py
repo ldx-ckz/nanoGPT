@@ -1,5 +1,6 @@
 from torch.distributed import init_process_group, destroy_process_group
 import argparse
+import hashlib
 from bisect import bisect_right
 import json
 import os
@@ -523,6 +524,8 @@ def parse_args():
     parser.add_argument("--dsa-warmup-steps", type=int, default=200)
     parser.add_argument("--dsa-loss-weight", type=float, default=1.0)
     parser.add_argument("--dsa-topk", type=int, default=128)
+    parser.add_argument("--resume", type=str,
+                        help="Resume training from a checkpoint.",)
     args = parser.parse_args()
     if args.total_batch_size <= 0 or (args.train_tokens is not None and args.train_tokens <= 0):
         parser.error("Global batch size and token budget must be positive")
@@ -545,6 +548,35 @@ def parse_args():
     return args
 
 
+def collect_rng_states(device, distributed):
+    local_state = {
+        "cpu_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": (
+            torch.cuda.get_rng_state(device)
+            if torch.device(device).type == "cuda" else None
+        ),
+    }
+    if not distributed:
+        return [local_state]
+
+    states = [None] * dist.get_world_size()
+    dist.all_gather_object(states, local_state)
+    return states
+
+
+def checkpoint_rng_state(checkpoint, rank, world_size):
+    if checkpoint.get("world_size") != world_size:
+        raise ValueError("Resume requires the same world_size as the checkpoint.")
+    if "rng_states" in checkpoint:
+        states = checkpoint["rng_states"]
+        if len(states) != world_size:
+            raise ValueError("Checkpoint RNG state count does not match world_size.")
+        return states[rank]
+    if world_size == 1:
+        return checkpoint
+    raise ValueError("Checkpoint lacks per-rank RNG states for DDP resume.")
+
+
 master_process = True
 
 
@@ -554,12 +586,12 @@ def main():
     ddp = int(os.environ.get('RANK', -1)) != -1
     if ddp:
         assert torch.cuda.is_available()
-        init_process_group(backend='nccl')
         ddp_rank = int(os.environ['RANK'])
         ddp_local_rank = int(os.environ['LOCAL_RANK'])
         ddp_world_size = int(os.environ['WORLD_SIZE'])
         device = f'cuda:{ddp_local_rank}'
         torch.cuda.set_device(device)
+        init_process_group(backend='nccl')
         master_process = ddp_rank == 0
     else:
         ddp_rank = 0
@@ -583,9 +615,11 @@ def main():
     B = args.batch_size
     T = args.seq_len
     data_root = PROJECT_DIR / args.data_dir
-    if not (data_root / "manifest.json").is_file():
+    manifest_path = data_root / "manifest.json"
+    if not manifest_path.is_file():
         raise FileNotFoundError(
             "Run python wikitext.py first; complete manifest.json is required")
+    manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     assert total_batch_size % (B*T*ddp_world_size) == 0
     grad_accum_steps = total_batch_size//(B*T*ddp_world_size)
     if master_process:
@@ -626,6 +660,51 @@ def main():
     optimizer = raw_model.configure_optimizers(
         weight_decay=0.1, learning_rate=max_lr, device=device)
 
+    start_step = 0
+    if args.resume:
+        checkpoint = torch.load(
+            args.resume,
+            map_location='cpu',
+            weights_only=True,
+        )
+        rng_state = checkpoint_rng_state(checkpoint, ddp_rank, ddp_world_size)
+        saved_args = checkpoint["training_config"]
+        resume_keys = (
+            "batch_size", "seq_len", "total_batch_size",
+            "max_steps", "max_lr", "warmup_steps",
+            "dsa_warmup_steps", "dsa_loss_weight",
+        )
+        for key in resume_keys:
+            if getattr(args, key) != saved_args[key]:
+                raise ValueError(
+                    f"Resume setting differs from checkpoint: {key}")
+        saved_manifest = checkpoint.get("manifest_sha256")
+        if saved_manifest is None:
+            if args.data_dir != saved_args["data_dir"]:
+                raise ValueError("Legacy checkpoint requires the original data_dir.")
+        elif saved_manifest != manifest_sha256:
+            raise ValueError("Dataset manifest differs from checkpoint.")
+        if asdict(raw_model.config) != checkpoint["config"]:
+            raise ValueError("Model config differs from checkpoint.")
+        start_step = checkpoint["completed_steps"]
+        if not 0 <= start_step < max_steps:
+            raise ValueError(
+                "Checkpoint has no remaining updates in this training plan.")
+        cuda_rng_state = rng_state["cuda_rng_state"]
+        if (cuda_rng_state is not None) != (device_type == "cuda"):
+            raise ValueError(
+                "Use the same device type as the original training run.")
+        raw_model.load_state_dict(checkpoint["model"], strict=True)
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        train_loader.position = checkpoint["train_position"]
+        torch.set_rng_state(rng_state["cpu_rng_state"])
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state, device=device)
+        if master_process:
+            print(
+                f"Resuming at step {start_step}, train position {train_loader.position}")
+        del checkpoint, rng_state
+
     run_dir = PROJECT_DIR / args.output_dir
     log_dir = run_dir / "log"
     checkpoints_dir = run_dir / "checkpoints"
@@ -639,10 +718,18 @@ def main():
             f"dataset: {data_root.name}; train tokens: {train_loader.total_tokens:,}; val tokens: {val_loader.total_tokens:,}")
         print(
             f"planned updates: {max_steps}; planned training tokens: {max_steps * total_batch_size:,}")
-        with open(log_file, "w") as f:
-            pass
+        log_path = Path(log_file)
+        if args.resume and log_path.is_file():
+            # Discard log entries after the checkpoint before replaying those steps.
+            lines = log_path.read_text(encoding="utf-8").splitlines(keepends=True)
+            log_path.write_text(
+                "".join(line for line in lines if line.strip() and int(line.split()[0]) < start_step),
+                encoding="utf-8",
+            )
+        else:
+            log_path.write_text("", encoding="utf-8")
 
-    for step in range(max_steps):
+    for step in range(start_step, max_steps):
         t0 = time.time()
         last_step = (step == max_steps-1)
         dsa_sparse = step >= args.dsa_warmup_steps
@@ -704,7 +791,10 @@ def main():
             with open(log_file, "a") as f:
                 f.write(f"{step} train {loss_accum.item():.6f}\n")
                 f.write(f"{step} index_kl {index_loss_accum.item():.6f}\n")
-            if (step + 1) % args.checkpoint_interval == 0 or last_step:
+
+        if (step + 1) % args.checkpoint_interval == 0 or last_step:
+            rng_states = collect_rng_states(device, ddp)
+            if master_process:
                 checkpoints_path = checkpoints_dir / f"model_{step + 1:05d}.pt"
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -713,8 +803,15 @@ def main():
                     'completed_steps': step + 1,
                     'training_config': vars(args),
                     'trained_tokens': (step + 1) * total_batch_size,
+                    'optimizer': optimizer.state_dict(),
+                    'train_position': train_loader.position,
+                    'manifest_sha256': manifest_sha256,
+                    'rng_states': rng_states,
+                    'world_size': ddp_world_size,
                 }
-                torch.save(checkpoint, checkpoints_path)
+                temporary_path = checkpoints_path.with_suffix(".pt.tmp")
+                torch.save(checkpoint, temporary_path)
+                os.replace(temporary_path, checkpoints_path)
                 print(f"saved checkpoint: {checkpoints_path}")
 
     if ddp:

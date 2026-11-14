@@ -1,13 +1,14 @@
 param(
     [ValidateSet('A', 'B', 'C', 'D')]
     [string]$Group,
+    [string]$Resume,
     [switch]$Run
 )
 
 $ErrorActionPreference = 'Stop'
 
-if ($Run -and -not $Group) {
-    throw 'Specify -Group A, B, C or D when using -Run.'
+if (($Run -or $Resume) -and -not $Group) {
+    throw 'Specify -Group A, B, C or D when using -Run or -Resume.'
 }
 if ($Run -and -not $IsLinux) {
     throw 'Run the two-GPU NCCL experiment on Linux with PowerShell 7.'
@@ -80,6 +81,9 @@ foreach ($id in $selectedGroups) {
             '--dsa-loss-weight', '1.0'
         )
     }
+    if ($Resume) {
+        $trainArgs += @('--resume', $Resume)
+    }
 
     $launchArgs = $launcherArgs + $trainArgs
     $quotedArgs = $launchArgs | ForEach-Object { '"{0}"' -f $_ }
@@ -89,7 +93,10 @@ foreach ($id in $selectedGroups) {
         continue
     }
 
-    if (Test-Path -LiteralPath $outputDir) {
+    if ($Resume -and -not (Test-Path -LiteralPath $Resume -PathType Leaf)) {
+        throw "Checkpoint does not exist: $Resume"
+    }
+    if (-not $Resume -and (Test-Path -LiteralPath $outputDir)) {
         throw "Run directory already exists: $outputDir"
     }
 
@@ -99,7 +106,8 @@ foreach ($id in $selectedGroups) {
     $gitStatus = @(git -C $repo status --porcelain)
     if ($LASTEXITCODE -ne 0) { throw 'Could not read Git status.' }
 
-    New-Item -ItemType Directory -Path $outputDir | Out-Null
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+    $metadataName = if ($Resume) { 'experiment.resume.json' } else { 'experiment.json' }
     [ordered]@{
         group = $id
         attention = $attention
@@ -118,7 +126,7 @@ foreach ($id in $selectedGroups) {
         python = $python
         arguments = $launchArgs
     } | ConvertTo-Json -Depth 4 |
-        Set-Content -LiteralPath (Join-Path $outputDir 'experiment.json') -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $outputDir $metadataName) -Encoding UTF8
 
     $previousCompileSetting = $env:TORCH_COMPILE_DISABLE
     try {
