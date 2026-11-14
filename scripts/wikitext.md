@@ -99,6 +99,8 @@ with KV-cache timing/memory logs, see [prediction.md](prediction.md).
 
 ## Four-group ablation on WikiText-103
 
+See the [completed experiment report](../results/wikitext-103-seed1337/README.md) for the dataset revision, measured results and validation curves.
+
 | Group | `--attention` | Architecture |
 | --- | --- | --- |
 | A | `gpt2` | GPT-2 with learned absolute positions, LayerNorm and GELU |
